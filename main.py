@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAh1xjL9U9lNZNghWdfB0HabMjnBU14_aM")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 genai.configure(api_key=GEMINI_API_KEY)
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
