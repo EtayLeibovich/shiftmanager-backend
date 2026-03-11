@@ -51,6 +51,39 @@ def run_migrations():
 models.Base.metadata.create_all(bind=engine)
 run_migrations()
 
+
+def auto_seed():
+    """יצירת עסק ומנהל ברירת מחדל אוטומטית אם לא קיימים"""
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        biz = db.query(models.Business).filter(models.Business.name == "העסק שלי").first()
+        if not biz:
+            biz = models.Business(name="העסק שלי", join_code="ADMIN1")
+            db.add(biz)
+            db.commit()
+            db.refresh(biz)
+        manager = db.query(models.User).filter(
+            models.User.business_id == biz.id,
+            models.User.role == "manager"
+        ).first()
+        if not manager:
+            manager = models.User(
+                business_id=biz.id,
+                full_name="מנהל ראשי",
+                role="manager",
+                passcode="1234",
+                is_active=True,
+                approval_status="approved",
+            )
+            db.add(manager)
+            db.commit()
+    finally:
+        db.close()
+
+
+auto_seed()
+
 app = FastAPI(title="ShiftManager SaaS API")
 
 app.add_middleware(
