@@ -11,7 +11,7 @@ import models
 import schemas
 import auth
 from database import engine, get_db
-import google.generativeai as genai
+from google import genai as google_genai
 import csv
 import io
 import random
@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-genai.configure(api_key=GEMINI_API_KEY)
+_genai_client = google_genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -1053,20 +1053,22 @@ def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
     )
 
     # בנה היסטוריית שיחה לפורמט של Gemini
-    chat_history = []
+    contents = []
     for msg in history:
-        if msg.get("role") == "user":
-            chat_history.append({"role": "user", "parts": [msg["content"]]})
-        elif msg.get("role") == "model":
-            chat_history.append({"role": "model", "parts": [msg["content"]]})
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role in ("user", "model"):
+            contents.append({"role": role, "parts": [{"text": content}]})
+    contents.append({"role": "user", "parts": [{"text": query}]})
 
     try:
-        model = genai.GenerativeModel(
-            "models/gemini-1.5-flash",
-            system_instruction=system_prompt
+        if not _genai_client:
+            return {"answer": "שגיאת AI: GEMINI_API_KEY לא מוגדר בסביבה."}
+        response = _genai_client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=contents,
+            config={"system_instruction": system_prompt},
         )
-        chat = model.start_chat(history=chat_history)
-        res = chat.send_message(query)
-        return {"answer": res.text}
+        return {"answer": response.text}
     except Exception as e:
         return {"answer": f"שגיאת AI: {str(e)}"}
