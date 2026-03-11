@@ -1062,7 +1062,7 @@ def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
 
     try:
         model = genai.GenerativeModel(
-            "gemini-1.5-flash",
+            "models/gemini-1.5-flash",
             system_instruction=system_prompt
         )
         chat = model.start_chat(history=chat_history)
