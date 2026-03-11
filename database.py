@@ -1,28 +1,26 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# הגדרת נתיב למסד הנתונים. אנחנו נשתמש ב-SQLite שייצור קובץ מקומי בתיקייה שלנו
-SQLALCHEMY_DATABASE_URL = "sqlite:///./shift_manager.db"
+# בסביבת production (Render) משתמש ב-DATABASE_URL, אחרת SQLite מקומי
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./shift_manager.db")
 
-# יצירת המנוע שמתחבר למסד הנתונים
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
+# Render נותן postgres:// אבל SQLAlchemy צריך postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# "מפעל" הסשנים שלנו. דרכו נבקש גישה לנתונים
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# מחלקה בסיסית שממנה נבנה את כל הטבלאות
 Base = declarative_base()
 
-# ==========================================
-# מנגנון ניהול משאבים (Memory & Connection Management)
-# ==========================================
+
 def get_db():
     db = SessionLocal()
     try:
-        # מספקים את החיבור לשרת לצורך ביצוע פעולות (קריאה/כתיבה)
         yield db
     finally:
-        # הקסם קורה כאן: ברגע שהפעולה מסתיימת, החיבור נסגר ומשוחרר מהזיכרון בוודאות מוחלטת!
         db.close()
