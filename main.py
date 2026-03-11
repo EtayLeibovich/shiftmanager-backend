@@ -111,6 +111,42 @@ def read_root():
     return {"message": "Welcome to ShiftManager API!"}
 
 
+@app.post("/setup/init")
+def setup_init(db: Session = Depends(get_db)):
+    """יצירת עסק ומנהל ראשוני אם לא קיימים"""
+    biz = db.query(models.Business).filter(models.Business.name == "העסק שלי").first()
+    if not biz:
+        biz = models.Business(name="העסק שלי", join_code="ADMIN1")
+        db.add(biz)
+        db.commit()
+        db.refresh(biz)
+
+    manager = db.query(models.User).filter(
+        models.User.business_id == biz.id,
+        models.User.role == "manager"
+    ).first()
+    if not manager:
+        manager = models.User(
+            business_id=biz.id,
+            full_name="מנהל ראשי",
+            role="manager",
+            passcode="1234",
+            is_active=True,
+            approval_status="approved",
+        )
+        db.add(manager)
+        db.commit()
+        db.refresh(manager)
+
+    return {
+        "status": "ok",
+        "business_id": biz.id,
+        "business_name": biz.name,
+        "join_code": biz.join_code,
+        "manager_passcode": manager.passcode,
+    }
+
+
 # ==========================================
 # AUTH
 # ==========================================
