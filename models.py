@@ -40,7 +40,8 @@ class User(Base):
     branch_id = Column(Integer, ForeignKey("branches.id"), nullable=True)
     full_name = Column(String, index=True)
     role = Column(String, default="worker")
-    passcode = Column(String)
+    passcode = Column(String)             # plaintext PIN — used as unique lookup identifier
+    passcode_hash = Column(String, nullable=True)  # bcrypt hash — used for secure auth verification
     hourly_rate = Column(Float, default=0.0, nullable=True)
     phone = Column(String, nullable=True)
     email = Column(String, nullable=True)

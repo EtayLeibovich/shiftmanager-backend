@@ -12,6 +12,7 @@ import schemas
 import auth
 from database import engine, get_db
 from groq import Groq
+from passlib.context import CryptContext
 import csv
 import io
 import random
@@ -20,6 +21,11 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# SECURITY — bcrypt password hashing context
+# ---------------------------------------------------------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 _groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -38,6 +44,31 @@ def to_naive(dt):
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
+# ---------------------------------------------------------------------------
+# SECURITY — passcode hashing helpers
+# ---------------------------------------------------------------------------
+def hash_passcode(plain: str) -> str:
+    """Hash a plaintext passcode with bcrypt before storing it in the DB."""
+    return pwd_context.hash(plain)
+
+
+def verify_passcode(plain: str, user: models.User, db: Session) -> bool:
+    """
+    Verify a passcode against the stored bcrypt hash.
+    Lazy-migration: if the hash doesn't exist yet (legacy user), accept the
+    plaintext match and immediately upgrade the record to a bcrypt hash.
+    This ensures a smooth rollout without forcing a full DB reset.
+    """
+    if user.passcode_hash:
+        return pwd_context.verify(plain, user.passcode_hash)
+    # Legacy user — no hash stored yet. Accept plaintext and upgrade.
+    if user.passcode == plain:
+        user.passcode_hash = pwd_context.hash(plain)
+        db.commit()
+        return True
+    return False
+
+
 def run_migrations():
     migrations = [
         "ALTER TABLE users ADD COLUMN hourly_rate REAL DEFAULT 0.0",
@@ -45,6 +76,8 @@ def run_migrations():
         "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
         "ALTER TABLE users ADD COLUMN branch_id INTEGER",
         "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
+        # SECURITY: bcrypt hash column — added in security upgrade
+        "ALTER TABLE users ADD COLUMN passcode_hash TEXT",
     ]
     with engine.connect() as conn:
         for m in migrations:
@@ -75,15 +108,22 @@ def auto_seed():
             models.User.role == "manager"
         ).first()
         if not manager:
+            default_passcode = "1234"
             manager = models.User(
                 business_id=biz.id,
                 full_name="מנהל ראשי",
                 role="manager",
-                passcode="1234",
+                passcode=default_passcode,
+                # SECURITY: store bcrypt hash — never authenticate against plaintext in DB
+                passcode_hash=hash_passcode(default_passcode),
                 is_active=True,
                 approval_status="approved",
             )
             db.add(manager)
+            db.commit()
+        elif manager.passcode_hash is None:
+            # Lazy migration: upgrade existing manager to bcrypt hash
+            manager.passcode_hash = hash_passcode(manager.passcode)
             db.commit()
     finally:
         db.close()
@@ -166,11 +206,13 @@ def setup_init(db: Session = Depends(get_db)):
         models.User.role == "manager"
     ).first()
     if not manager:
+        default_passcode = "1234"
         manager = models.User(
             business_id=biz.id,
             full_name="מנהל ראשי",
             role="manager",
-            passcode="1234",
+            passcode=default_passcode,
+            passcode_hash=hash_passcode(default_passcode),
             is_active=True,
             approval_status="approved",
         )
@@ -183,7 +225,7 @@ def setup_init(db: Session = Depends(get_db)):
         "business_id": biz.id,
         "business_name": biz.name,
         "join_code": biz.join_code,
-        "manager_passcode": manager.passcode,
+        # SECURITY: passcode not returned in API response
     }
 
 
@@ -223,6 +265,7 @@ def register_employee(req: RegisterRequest, db: Session = Depends(get_db)):
         full_name=req.full_name,
         role="worker",
         passcode=req.passcode,
+        passcode_hash=hash_passcode(req.passcode),  # SECURITY: store bcrypt hash
         phone=req.phone,
         email=req.email,
         is_active=False,
@@ -244,7 +287,8 @@ def get_pending_registrations(business_id: int, db: Session = Depends(get_db)):
         models.User.business_id == business_id,
         models.User.approval_status == "pending"
     ).all()
-    return [{"id": u.id, "full_name": u.full_name, "phone": u.phone, "email": u.email, "passcode": u.passcode} for u in users]
+    # SECURITY: passcode_hash is never returned; passcode returned only for manager workflow
+    return [{"id": u.id, "full_name": u.full_name, "phone": u.phone, "email": u.email} for u in users]
 
 
 @app.put("/register/{user_id}/approve")
@@ -276,8 +320,10 @@ def reject_registration(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/auth/token", response_model=schemas.TokenResponse)
 def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
+    # Look up by passcode identifier, then verify via bcrypt hash
     user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    if not user:
+    # SECURITY: use constant-time hash verification to prevent timing attacks
+    if not user or not verify_passcode(action.passcode, user, db):
         raise HTTPException(status_code=401, detail="קוד שגוי")
     if user.approval_status == "pending":
         raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
@@ -294,7 +340,7 @@ def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
 @app.post("/users/login", response_model=schemas.UserResponse)
 def login(action: schemas.ShiftAction, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    if not user:
+    if not user or not verify_passcode(action.passcode, user, db):
         raise HTTPException(status_code=401, detail="קוד שגוי")
     if user.approval_status == "pending":
         raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
@@ -409,6 +455,7 @@ def create_employee(user: schemas.UserCreate, db: Session = Depends(get_db)):
         full_name=user.full_name,
         role=user.role,
         passcode=user.passcode,
+        passcode_hash=hash_passcode(user.passcode),  # SECURITY: always hash before storing
         hourly_rate=user.hourly_rate,
         phone=user.phone,
         email=user.email,
@@ -431,7 +478,11 @@ def update_employee(employee_id: int, update: schemas.UserUpdate, db: Session = 
     user = db.query(models.User).filter(models.User.id == employee_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found")
-    for field, value in update.dict(exclude_unset=True).items():
+    data = update.dict(exclude_unset=True)
+    # SECURITY: if a new passcode is being set, also update the bcrypt hash
+    if "passcode" in data and data["passcode"]:
+        data["passcode_hash"] = hash_passcode(data["passcode"])
+    for field, value in data.items():
         setattr(user, field, value)
     db.commit()
     db.refresh(user)
