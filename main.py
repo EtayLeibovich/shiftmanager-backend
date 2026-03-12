@@ -1105,7 +1105,7 @@ def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
         if not _genai_client:
             return {"answer": "שגיאת AI: GEMINI_API_KEY לא מוגדר בסביבה."}
         response = _genai_client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=contents,
             config={"system_instruction": system_prompt},
         )
