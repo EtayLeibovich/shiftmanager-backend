@@ -6,6 +6,6 @@ python-jose[cryptography]
 passlib[bcrypt]
 bcrypt
 python-dotenv
-google-genai
+groq
 python-multipart
 psycopg2-binary

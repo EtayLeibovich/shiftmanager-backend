@@ -11,7 +11,7 @@ import models
 import schemas
 import auth
 from database import engine, get_db
-from google import genai as google_genai
+from groq import Groq
 import csv
 import io
 import random
@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-_genai_client = google_genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+_groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -1092,23 +1092,25 @@ def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
         f"**50 המשמרות האחרונות:**\n{shifts_context}"
     )
 
-    # בנה היסטוריית שיחה לפורמט של Gemini
-    contents = []
+    # בנה היסטוריית שיחה לפורמט של Groq (OpenAI-compatible)
+    messages = [{"role": "system", "content": system_prompt}]
     for msg in history:
         role = msg.get("role")
         content = msg.get("content", "")
-        if role in ("user", "model"):
-            contents.append({"role": role, "parts": [{"text": content}]})
-    contents.append({"role": "user", "parts": [{"text": query}]})
+        if role == "user":
+            messages.append({"role": "user", "content": content})
+        elif role == "model":
+            messages.append({"role": "assistant", "content": content})
+    messages.append({"role": "user", "content": query})
 
     try:
-        if not _genai_client:
-            return {"answer": "שגיאת AI: GEMINI_API_KEY לא מוגדר בסביבה."}
-        response = _genai_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=contents,
-            config={"system_instruction": system_prompt},
+        if not _groq_client:
+            return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר בסביבה."}
+        response = _groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=1024,
         )
-        return {"answer": response.text}
+        return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"answer": f"שגיאת AI: {str(e)}"}
