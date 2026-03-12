@@ -31,6 +31,13 @@ def now_israel():
     return datetime.now(ISRAEL_TZ).replace(tzinfo=None)
 
 
+def to_naive(dt):
+    """Strip timezone info so arithmetic works whether DB returns aware or naive datetimes."""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+
 def run_migrations():
     migrations = [
         "ALTER TABLE users ADD COLUMN hourly_rate REAL DEFAULT 0.0",
@@ -473,7 +480,7 @@ def clock_out(action: schemas.ShiftAction, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="אין משמרת פתוחה")
     open_shift.clock_out = now_israel()
     open_shift.total_hours = round(
-        (open_shift.clock_out - open_shift.clock_in).total_seconds() / 3600.0, 2
+        (open_shift.clock_out - to_naive(open_shift.clock_in)).total_seconds() / 3600.0, 2
     )
     db.commit()
     db.refresh(open_shift)
@@ -610,7 +617,7 @@ def get_active_workers(business_id: int, db: Session = Depends(get_db)):
             "shift_id": s.Shift.id,
             "full_name": s.User.full_name,
             "clock_in": s.Shift.clock_in,
-            "hours_so_far": round((now - s.Shift.clock_in).total_seconds() / 3600.0, 1),
+            "hours_so_far": round((now - to_naive(s.Shift.clock_in)).total_seconds() / 3600.0, 1),
         }
         for s in open_shifts
     ]
@@ -638,10 +645,10 @@ def manual_close_shift(shift_id: int, req: ManualShiftClose, db: Session = Depen
     if not shift:
         raise HTTPException(status_code=404, detail="משמרת לא נמצאה")
     # מנהל יכול לסגור משמרת בכל זמן — עבר או עתיד
-    if req.clock_out < shift.clock_in:
+    if req.clock_out < to_naive(shift.clock_in):
         raise HTTPException(status_code=400, detail="יציאה לפני כניסה — בדוק תאריכים")
     shift.clock_out = req.clock_out
-    shift.total_hours = round((shift.clock_out - shift.clock_in).total_seconds() / 3600.0, 2)
+    shift.total_hours = round((shift.clock_out - to_naive(shift.clock_in)).total_seconds() / 3600.0, 2)
     db.commit()
     db.refresh(shift)
     return shift
@@ -674,7 +681,7 @@ def force_clock_out(shift_id: int, db: Session = Depends(get_db)):
     if shift and not shift.clock_out:
         shift.clock_out = now_israel()
         shift.total_hours = round(
-            (shift.clock_out - shift.clock_in).total_seconds() / 3600.0, 2
+            (shift.clock_out - to_naive(shift.clock_in)).total_seconds() / 3600.0, 2
         )
         db.commit()
     return {"status": "ok"}
