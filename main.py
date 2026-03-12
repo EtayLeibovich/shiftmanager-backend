@@ -775,6 +775,16 @@ def edit_shift(shift_id: int, request: ShiftEditRequest, db: Session = Depends(g
     return shift
 
 
+@app.delete("/shifts/{shift_id}")
+def delete_shift(shift_id: int, db: Session = Depends(get_db)):
+    shift = db.query(models.Shift).filter(models.Shift.id == shift_id).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    db.delete(shift)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/dashboard/all-shifts/{business_id}")
 def get_all_shifts(
     business_id: int,
