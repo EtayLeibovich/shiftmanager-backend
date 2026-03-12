@@ -52,6 +52,22 @@ def hash_passcode(plain: str) -> str:
     return pwd_context.hash(plain)
 
 
+def calc_shift_salary(hours: float, hourly_rate: float) -> float:
+    """
+    Israeli labor law overtime calculation per shift:
+      - Hours 1–8  : 100% (regular)
+      - Hours 8–10 : 125% (rishon / shniyah)
+      - Hours 10+  : 150% (shilishit+)
+    """
+    if (hourly_rate or 0) <= 0 or (hours or 0) <= 0:
+        return 0.0
+    rate = hourly_rate
+    regular      = min(hours, 8.0)          * rate * 1.00
+    overtime_125 = max(0.0, min(hours, 10.0) - 8.0)  * rate * 1.25
+    overtime_150 = max(0.0, hours - 10.0)   * rate * 1.50
+    return round(regular + overtime_125 + overtime_150, 2)
+
+
 def verify_passcode(plain: str, user: models.User, db: Session) -> bool:
     """
     Verify a passcode against the stored bcrypt hash.
@@ -565,16 +581,22 @@ def get_personal_stats(passcode: str, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404)
     now = datetime.now()
-    monthly_hours = (
-        db.query(func.sum(models.Shift.total_hours))
+    # Fetch individual completed shifts to calculate overtime salary per-shift
+    monthly_shifts = (
+        db.query(models.Shift)
         .filter(
             models.Shift.user_id == user.id,
             extract("year", models.Shift.clock_in) == now.year,
             extract("month", models.Shift.clock_in) == now.month,
+            models.Shift.clock_out != None,
         )
-        .scalar()
-        or 0.0
+        .all()
     )
+    monthly_hours = round(sum(s.total_hours for s in monthly_shifts if s.total_hours), 2)
+    estimated_salary = round(sum(
+        calc_shift_salary(s.total_hours, user.hourly_rate or 0.0)
+        for s in monthly_shifts if s.total_hours
+    ), 2)
     upcoming = (
         db.query(models.ScheduledShift)
         .filter(
@@ -603,8 +625,8 @@ def get_personal_stats(passcode: str, db: Session = Depends(get_db)):
             "hourly_rate": user.hourly_rate or 0.0,
             "business_id": user.business_id,
         },
-        "monthly_hours": round(monthly_hours, 2),
-        "estimated_salary": round(monthly_hours * (user.hourly_rate or 0.0), 2),
+        "monthly_hours": monthly_hours,
+        "estimated_salary": estimated_salary,
         "total_shifts": db.query(models.Shift).filter(models.Shift.user_id == user.id).count(),
         "upcoming_shifts": len(upcoming),
         "pending_leave": pending_leave,
@@ -1040,6 +1062,11 @@ def get_monthly_report(
             .all()
         )
         total_hours = sum(s.total_hours for s in shifts if s.total_hours)
+        # Overtime salary: calculated per-shift so each shift triggers its own overtime tier
+        estimated_salary = sum(
+            calc_shift_salary(s.total_hours, w.hourly_rate or 0.0)
+            for s in shifts if s.total_hours
+        )
         report_rows.append(
             schemas.SalaryReportRow(
                 user_id=w.id,
@@ -1048,7 +1075,7 @@ def get_monthly_report(
                 total_shifts=len(shifts),
                 total_hours=round(total_hours, 2),
                 hourly_rate=w.hourly_rate or 0.0,
-                estimated_salary=round(total_hours * (w.hourly_rate or 0.0), 2),
+                estimated_salary=round(estimated_salary, 2),
             )
         )
     return schemas.MonthlyReport(
@@ -1088,13 +1115,17 @@ def export_monthly_csv(
             .all()
         )
         total_hours = sum(s.total_hours for s in shifts if s.total_hours)
+        estimated_salary = sum(
+            calc_shift_salary(s.total_hours, w.hourly_rate or 0.0)
+            for s in shifts if s.total_hours
+        )
         writer.writerow([
             w.full_name,
             w.role,
             len(shifts),
             round(total_hours, 2),
             w.hourly_rate or 0.0,
-            round(total_hours * (w.hourly_rate or 0.0), 2),
+            round(estimated_salary, 2),
         ])
 
     output.seek(0)
