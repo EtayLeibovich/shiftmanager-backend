@@ -92,16 +92,18 @@ def run_migrations():
         "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
         "ALTER TABLE users ADD COLUMN branch_id INTEGER",
         "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
-        # SECURITY: bcrypt hash column — added in security upgrade
         "ALTER TABLE users ADD COLUMN passcode_hash TEXT",
+        "ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'",
     ]
-    with engine.connect() as conn:
-        for m in migrations:
+    for m in migrations:
+        # כל migration רץ בחיבור נפרד — חיוני ב-PostgreSQL שבו שגיאה
+        # סוגרת את כל הטרנזקציה הנוכחית ומונעת הרצת פקודות נוספות
+        with engine.connect() as conn:
             try:
                 conn.execute(text(m))
                 conn.commit()
             except Exception:
-                pass
+                conn.rollback()  # חובה ב-PostgreSQL לנקות את הטרנזקציה השגויה
 
 
 models.Base.metadata.create_all(bind=engine)
