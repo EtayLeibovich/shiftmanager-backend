@@ -125,26 +125,38 @@ def get_setup_user(authorization: str = Header(None), db: Session = Depends(get_
 
 
 def run_migrations():
-    migrations = [
-        "ALTER TABLE users ADD COLUMN hourly_rate REAL DEFAULT 0.0",
-        "ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN branch_id INTEGER",
-        "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
-        "ALTER TABLE users ADD COLUMN passcode_hash TEXT",
-        "ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'",
-        "ALTER TABLE users ADD COLUMN totp_secret TEXT",
-        "ALTER TABLE users ADD COLUMN is_2fa_enabled INTEGER DEFAULT 0",
-    ]
+    is_postgres = not str(engine.url).startswith("sqlite")
+    if is_postgres:
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS hourly_rate REAL DEFAULT 0.0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS branch_id INTEGER",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS passcode_hash TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'approved'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled INTEGER DEFAULT 0",
+        ]
+    else:
+        migrations = [
+            "ALTER TABLE users ADD COLUMN hourly_rate REAL DEFAULT 0.0",
+            "ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN branch_id INTEGER",
+            "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN passcode_hash TEXT",
+            "ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'",
+            "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+            "ALTER TABLE users ADD COLUMN is_2fa_enabled INTEGER DEFAULT 0",
+        ]
     for m in migrations:
-        # כל migration רץ בחיבור נפרד — חיוני ב-PostgreSQL שבו שגיאה
-        # סוגרת את כל הטרנזקציה הנוכחית ומונעת הרצת פקודות נוספות
         with engine.connect() as conn:
             try:
                 conn.execute(text(m))
                 conn.commit()
             except Exception:
-                conn.rollback()  # חובה ב-PostgreSQL לנקות את הטרנזקציה השגויה
+                conn.rollback()
 
 
 models.Base.metadata.create_all(bind=engine)
