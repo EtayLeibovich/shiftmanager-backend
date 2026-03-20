@@ -132,11 +132,13 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS branch_id INTEGER",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passcode_hash TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'approved'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ALTER COLUMN is_2fa_enabled TYPE BOOLEAN USING is_2fa_enabled::boolean",
+            "ALTER TABLE users ALTER COLUMN is_active TYPE BOOLEAN USING is_active::boolean",
         ]
     else:
         migrations = [
