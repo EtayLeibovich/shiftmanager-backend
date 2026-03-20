@@ -447,65 +447,62 @@ def setup_2fa(current_user: models.User = Depends(get_setup_user), db: Session =
 
 @app.post("/auth/verify-2fa")
 def verify_2fa(body: schemas.TwoFactorVerifyRequest, db: Session = Depends(get_db)):
-    """
-    Dual-purpose endpoint — handles two flows based on the pending token's scope:
+    try:
+        # 1. Validate pending token
+        payload = auth.verify_token(body.pending_token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="טוקן פג תוקף — התחבר מחדש")
+        scope = payload.get("scope")
+        if scope not in ("2fa_pending", "2fa_setup"):
+            raise HTTPException(status_code=401, detail="טוקן לא תקף")
 
-    1. scope='2fa_pending'  (login flow):
-       Verifies the TOTP code, then issues the full JWT access token.
+        # 2. Validate user_id exists in payload
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="טוקן פגום")
 
-    2. scope='2fa_setup'  (setup activation flow):
-       Verifies the TOTP code against the newly generated secret,
-       then sets is_2fa_enabled=True to complete the setup.
+        # 3. Load user from DB
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="משתמש לא נמצא")
 
-    The TOTP window is ±1 step (±30 seconds) to allow for minor clock drift.
-    """
-    payload = auth.verify_token(body.pending_token)
-    if not payload or payload.get("scope") not in ("2fa_pending", "2fa_setup"):
-        raise HTTPException(status_code=401, detail="טוקן לא תקף או פג תוקף")
+        # 4. Verify totp_secret exists before using pyotp
+        if not user.totp_secret:
+            raise HTTPException(status_code=400, detail="2FA לא מוגדר לחשבון זה — התחבר מחדש")
 
-    user = db.query(models.User).filter(models.User.id == payload["user_id"]).first()
-    if not user or not user.totp_secret:
-        raise HTTPException(status_code=400, detail="2FA לא מוגדר לחשבון זה")
+        # 5. Verify TOTP code safely
+        try:
+            totp = pyotp.TOTP(user.totp_secret)
+            valid = totp.verify(str(body.code).strip(), valid_window=1)
+        except Exception:
+            raise HTTPException(status_code=400, detail="קוד לא תקין")
 
-    totp = pyotp.TOTP(user.totp_secret)
-    # valid_window=1 allows ±30 sec clock drift (one time step in each direction)
-    if not totp.verify(body.code, valid_window=1):
-        raise HTTPException(status_code=401, detail="קוד שגוי — נסה שוב")
+        if not valid:
+            raise HTTPException(status_code=401, detail="קוד שגוי — נסה שוב")
 
-    scope = payload["scope"]
-
-    if scope == "2fa_setup":
-        # Activation: code is correct → enable 2FA and issue full JWT so user enters directly
-        user.is_2fa_enabled = True
-        db.commit()
-        token = auth.create_access_token({
-            "user_id": user.id,
-            "business_id": user.business_id,
-            "role": user.role
-        })
-        return {"access_token": token, "token_type": "bearer", "setup_complete": True, "user": {
+        # 6. Build user dict for response
+        user_data = {
             "id": user.id, "business_id": user.business_id, "full_name": user.full_name,
             "role": user.role, "hourly_rate": user.hourly_rate, "phone": user.phone,
             "email": user.email, "branch_id": user.branch_id, "is_active": user.is_active,
-        }}
+        }
 
-    # Login flow: issue the full access token
-    token = auth.create_access_token({
-        "user_id": user.id,
-        "business_id": user.business_id,
-        "role": user.role
-    })
-    return {"access_token": token, "token_type": "bearer", "user": {
-        "id": user.id,
-        "business_id": user.business_id,
-        "full_name": user.full_name,
-        "role": user.role,
-        "hourly_rate": user.hourly_rate,
-        "phone": user.phone,
-        "email": user.email,
-        "branch_id": user.branch_id,
-        "is_active": user.is_active,
-    }}
+        # 7. Setup flow: activate 2FA and issue full token
+        if scope == "2fa_setup":
+            user.is_2fa_enabled = True
+            db.commit()
+            token = auth.create_access_token({"user_id": user.id, "business_id": user.business_id, "role": user.role})
+            return {"access_token": token, "token_type": "bearer", "setup_complete": True, "user": user_data}
+
+        # 8. Login flow: issue full token
+        token = auth.create_access_token({"user_id": user.id, "business_id": user.business_id, "role": user.role})
+        return {"access_token": token, "token_type": "bearer", "user": user_data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"שגיאת שרת: {str(e)}")
 
 
 @app.get("/auth/2fa-status")
