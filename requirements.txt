@@ -9,3 +9,5 @@ python-dotenv
 groq
 python-multipart
 psycopg2-binary
+pyotp
+qrcode[pil]

@@ -186,6 +186,25 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
+class TwoFactorRequiredResponse(BaseModel):
+    """Returned by /auth/token when the user has 2FA enabled."""
+    requires_2fa: bool = True
+    pending_token: str   # short-lived JWT (5 min), scope='2fa_pending'
+
+
+class TwoFactorVerifyRequest(BaseModel):
+    """Body for /auth/verify-2fa — covers both login and setup-confirmation flows."""
+    pending_token: str   # the short-lived JWT returned by /auth/token or /auth/setup-2fa
+    code: str            # 6-digit TOTP code from Google Authenticator
+
+
+class TwoFactorSetupResponse(BaseModel):
+    """Returned by /auth/setup-2fa."""
+    provisioning_uri: str   # otpauth:// URI — encode this as a QR code in the frontend
+    secret: str             # base32 secret — show as fallback for manual entry
+    setup_token: str        # short-lived JWT (5 min), scope='2fa_setup' — use in verify-2fa
+
+
 # ==========================================
 # Reports
 # ==========================================

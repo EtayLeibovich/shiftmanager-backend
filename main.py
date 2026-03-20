@@ -18,6 +18,7 @@ import io
 import random
 import string
 import os
+import pyotp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -85,6 +86,44 @@ def verify_passcode(plain: str, user: models.User, db: Session) -> bool:
     return False
 
 
+def get_current_user(authorization: str = Header(None), db: Session = Depends(get_db)) -> models.User:
+    """
+    FastAPI dependency: extracts and validates the Bearer JWT from the Authorization header.
+    Explicitly rejects 2FA pending/setup tokens — only full access tokens are accepted here.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="לא מורשה — נדרש טוקן")
+    token = authorization.split(" ", 1)[1]
+    payload = auth.verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="טוקן לא תקף או פג תוקף")
+    if payload.get("scope") in ("2fa_pending", "2fa_setup"):
+        raise HTTPException(status_code=401, detail="נדרש אימות 2FA להשלמת ההתחברות")
+    user = db.query(models.User).filter(models.User.id == payload["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    return user
+
+
+def get_setup_user(authorization: str = Header(None), db: Session = Depends(get_db)) -> models.User:
+    """
+    Like get_current_user but also accepts 'setup_required' tokens —
+    used only by /auth/setup-2fa so a manager can set up 2FA right after first login.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="לא מורשה — נדרש טוקן")
+    token = authorization.split(" ", 1)[1]
+    payload = auth.verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="טוקן לא תקף או פג תוקף")
+    if payload.get("scope") in ("2fa_pending", "2fa_setup"):
+        raise HTTPException(status_code=401, detail="טוקן לא תקף לפעולה זו")
+    user = db.query(models.User).filter(models.User.id == payload["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    return user
+
+
 def run_migrations():
     migrations = [
         "ALTER TABLE users ADD COLUMN hourly_rate REAL DEFAULT 0.0",
@@ -94,6 +133,8 @@ def run_migrations():
         "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN passcode_hash TEXT",
         "ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'",
+        "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+        "ALTER TABLE users ADD COLUMN is_2fa_enabled INTEGER DEFAULT 0",
     ]
     for m in migrations:
         # כל migration רץ בחיבור נפרד — חיוני ב-PostgreSQL שבו שגיאה
@@ -164,6 +205,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 class ShiftEditRequest(BaseModel):
@@ -336,7 +382,7 @@ def reject_registration(user_id: int, db: Session = Depends(get_db)):
     return {"message": "נדחה"}
 
 
-@app.post("/auth/token", response_model=schemas.TokenResponse)
+@app.post("/auth/token")
 def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
     # Look up by passcode identifier, then verify via bcrypt hash
     user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
@@ -347,12 +393,135 @@ def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
     if user.approval_status == "rejected":
         raise HTTPException(status_code=403, detail="הבקשה נדחתה על ידי המנהל")
+
+    # --- 2FA gate (managers only) ---
+    if user.role == "manager":
+        if user.is_2fa_enabled and user.totp_secret:
+            # 2FA active → challenge with 6-digit code
+            pending_token = auth.create_pending_token({"user_id": user.id, "scope": "2fa_pending"})
+            return {"requires_2fa": True, "pending_token": pending_token}
+        else:
+            # 2FA not set up yet → force mandatory setup before entering admin
+            pending_token = auth.create_pending_token({"user_id": user.id, "scope": "setup_required"})
+            return {"requires_2fa_setup": True, "pending_token": pending_token}
+
     token = auth.create_access_token({
         "user_id": user.id,
         "business_id": user.business_id,
         "role": user.role
     })
     return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@app.post("/auth/setup-2fa", response_model=schemas.TwoFactorSetupResponse)
+def setup_2fa(current_user: models.User = Depends(get_setup_user), db: Session = Depends(get_db)):
+    """
+    Generates a new TOTP secret for the authenticated user and returns:
+    - provisioning_uri: encode as QR code in the frontend
+    - secret: base32 string for manual entry into Google Authenticator
+    - setup_token: short-lived JWT to be passed to /auth/verify-2fa to confirm setup
+
+    NOTE: is_2fa_enabled is NOT set to True here. The user must first scan the QR code
+    and verify a valid code via /auth/verify-2fa to activate 2FA. This prevents lockout
+    if the user abandons the setup flow midway.
+    """
+    secret = pyotp.random_base32()
+    provisioning_uri = pyotp.TOTP(secret).provisioning_uri(
+        name=current_user.full_name,
+        issuer_name="ShiftManager"
+    )
+    # Persist the new secret (not yet enabled) so verify-2fa can read it
+    current_user.totp_secret = secret
+    current_user.is_2fa_enabled = False  # only activated after successful verify
+    db.commit()
+
+    setup_token = auth.create_pending_token({
+        "user_id": current_user.id,
+        "scope": "2fa_setup"
+    })
+    return {
+        "provisioning_uri": provisioning_uri,
+        "secret": secret,
+        "setup_token": setup_token
+    }
+
+
+@app.post("/auth/verify-2fa")
+def verify_2fa(body: schemas.TwoFactorVerifyRequest, db: Session = Depends(get_db)):
+    """
+    Dual-purpose endpoint — handles two flows based on the pending token's scope:
+
+    1. scope='2fa_pending'  (login flow):
+       Verifies the TOTP code, then issues the full JWT access token.
+
+    2. scope='2fa_setup'  (setup activation flow):
+       Verifies the TOTP code against the newly generated secret,
+       then sets is_2fa_enabled=True to complete the setup.
+
+    The TOTP window is ±1 step (±30 seconds) to allow for minor clock drift.
+    """
+    payload = auth.verify_token(body.pending_token)
+    if not payload or payload.get("scope") not in ("2fa_pending", "2fa_setup"):
+        raise HTTPException(status_code=401, detail="טוקן לא תקף או פג תוקף")
+
+    user = db.query(models.User).filter(models.User.id == payload["user_id"]).first()
+    if not user or not user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA לא מוגדר לחשבון זה")
+
+    totp = pyotp.TOTP(user.totp_secret)
+    # valid_window=1 allows ±30 sec clock drift (one time step in each direction)
+    if not totp.verify(body.code, valid_window=1):
+        raise HTTPException(status_code=401, detail="קוד שגוי — נסה שוב")
+
+    scope = payload["scope"]
+
+    if scope == "2fa_setup":
+        # Activation: code is correct → enable 2FA and issue full JWT so user enters directly
+        user.is_2fa_enabled = True
+        db.commit()
+        token = auth.create_access_token({
+            "user_id": user.id,
+            "business_id": user.business_id,
+            "role": user.role
+        })
+        return {"access_token": token, "token_type": "bearer", "setup_complete": True, "user": {
+            "id": user.id, "business_id": user.business_id, "full_name": user.full_name,
+            "role": user.role, "hourly_rate": user.hourly_rate, "phone": user.phone,
+            "email": user.email, "branch_id": user.branch_id, "is_active": user.is_active,
+        }}
+
+    # Login flow: issue the full access token
+    token = auth.create_access_token({
+        "user_id": user.id,
+        "business_id": user.business_id,
+        "role": user.role
+    })
+    return {"access_token": token, "token_type": "bearer", "user": {
+        "id": user.id,
+        "business_id": user.business_id,
+        "full_name": user.full_name,
+        "role": user.role,
+        "hourly_rate": user.hourly_rate,
+        "phone": user.phone,
+        "email": user.email,
+        "branch_id": user.branch_id,
+        "is_active": user.is_active,
+    }}
+
+
+@app.get("/auth/2fa-status")
+def get_2fa_status(current_user: models.User = Depends(get_current_user)):
+    """Returns whether 2FA is currently enabled for the authenticated user."""
+    return {"is_2fa_enabled": bool(current_user.is_2fa_enabled)}
+
+
+@app.post("/auth/disable-2fa")
+def disable_2fa(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Disables 2FA for the authenticated user and clears the TOTP secret."""
+    current_user.is_2fa_enabled = False
+    current_user.totp_secret = None
+    db.commit()
+    return {"success": True, "message": "אימות דו-שלבי כובה"}
 
 
 @app.post("/users/login", response_model=schemas.UserResponse)
