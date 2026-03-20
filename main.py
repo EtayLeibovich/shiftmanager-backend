@@ -394,16 +394,15 @@ def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
     if user.approval_status == "rejected":
         raise HTTPException(status_code=403, detail="הבקשה נדחתה על ידי המנהל")
 
-    # --- 2FA gate (managers only) ---
-    if user.role == "manager":
-        if user.is_2fa_enabled and user.totp_secret:
-            # 2FA active → challenge with 6-digit code
-            pending_token = auth.create_pending_token({"user_id": user.id, "scope": "2fa_pending"})
-            return {"requires_2fa": True, "pending_token": pending_token}
-        else:
-            # 2FA not set up yet → force mandatory setup before entering admin
-            pending_token = auth.create_pending_token({"user_id": user.id, "scope": "setup_required"})
-            return {"requires_2fa_setup": True, "pending_token": pending_token}
+    # --- 2FA gate (all users) ---
+    if user.is_2fa_enabled and user.totp_secret:
+        # 2FA active → challenge with 6-digit code
+        pending_token = auth.create_pending_token({"user_id": user.id, "scope": "2fa_pending"})
+        return {"requires_2fa": True, "pending_token": pending_token}
+    else:
+        # 2FA not set up yet → force mandatory setup
+        pending_token = auth.create_pending_token({"user_id": user.id, "scope": "setup_required"})
+        return {"requires_2fa_setup": True, "pending_token": pending_token}
 
     token = auth.create_access_token({
         "user_id": user.id,
