@@ -158,8 +158,12 @@ def run_migrations():
             user_id INTEGER REFERENCES users(id),
             week_start DATE,
             day_of_week INTEGER,
-            shift_type VARCHAR
+            shift_type VARCHAR,
+            position VARCHAR,
+            note TEXT
         )""",
+        "ALTER TABLE shift_roster ADD COLUMN IF NOT EXISTS position VARCHAR",
+        "ALTER TABLE shift_roster ADD COLUMN IF NOT EXISTS note TEXT",
         """CREATE TABLE IF NOT EXISTS shift_preferences (
             id SERIAL PRIMARY KEY,
             business_id INTEGER REFERENCES businesses(id),
@@ -1534,7 +1538,7 @@ def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db))
         models.ShiftRoster.user_id == user.id,
         models.ShiftRoster.week_start == week
     ).all()
-    days_map = {e.day_of_week: e.shift_type for e in entries}
+    days_map = {e.day_of_week: e for e in entries}
     prefs = db.query(models.ShiftPreference).filter(
         models.ShiftPreference.user_id == user.id,
         models.ShiftPreference.week_start == week
@@ -1544,11 +1548,14 @@ def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db))
         "week_start": week_start,
         "name": user.full_name,
         "days": [
-            {"day": d, "day_name": DAY_NAMES[d], "shift_type": days_map.get(d, "off"),
+            {"day": d, "day_name": DAY_NAMES[d],
+             "shift_type": days_map[d].shift_type if d in days_map else "off",
+             "position": days_map[d].position or "" if d in days_map else "",
+             "note": days_map[d].note or "" if d in days_map else "",
              "preference": prefs_map.get(d),
-             "label": SHIFT_TIMES[days_map.get(d, "off")]["label"],
-             "start": SHIFT_TIMES[days_map.get(d, "off")]["start"],
-             "end": SHIFT_TIMES[days_map.get(d, "off")]["end"]}
+             "label": SHIFT_TIMES[days_map[d].shift_type if d in days_map else "off"]["label"],
+             "start": SHIFT_TIMES[days_map[d].shift_type if d in days_map else "off"]["start"],
+             "end": SHIFT_TIMES[days_map[d].shift_type if d in days_map else "off"]["end"]}
             for d in range(7)
         ]
     }
@@ -1616,12 +1623,19 @@ def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db))
         models.ShiftRoster.business_id == business_id,
         models.ShiftRoster.week_start == week
     ).all()
-    roster_map = {(e.user_id, e.day_of_week): e.shift_type for e in entries}
+    roster_map = {(e.user_id, e.day_of_week): e for e in entries}
     return {
         "week_start": week_start,
         "employees": [
             {"id": emp.id, "name": emp.full_name,
-             "days": [roster_map.get((emp.id, d), "off") for d in range(7)]}
+             "days": [
+                 {"shift_type": roster_map[(emp.id, d)].shift_type,
+                  "position": roster_map[(emp.id, d)].position or "",
+                  "note": roster_map[(emp.id, d)].note or ""}
+                 if (emp.id, d) in roster_map else
+                 {"shift_type": "off", "position": "", "note": ""}
+                 for d in range(7)
+             ]}
             for emp in employees
         ]
     }
@@ -1640,7 +1654,9 @@ def save_roster(business_id: int, payload: dict, db: Session = Depends(get_db)):
         if e.get("shift_type") and e["shift_type"] != "off":
             db.add(models.ShiftRoster(
                 business_id=business_id, user_id=e["user_id"],
-                week_start=week, day_of_week=e["day"], shift_type=e["shift_type"]
+                week_start=week, day_of_week=e["day"], shift_type=e["shift_type"],
+                position=e.get("position", "") or None,
+                note=e.get("note", "") or None
             ))
     db.commit()
     return {"ok": True}

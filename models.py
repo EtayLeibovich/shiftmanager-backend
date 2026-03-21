@@ -83,6 +83,8 @@ class ShiftRoster(Base):
     week_start = Column(Date)           # תאריך ראשון של השבוע (ראשון)
     day_of_week = Column(Integer)       # 0=ראשון, 1=שני, ..., 6=שבת
     shift_type = Column(String)         # 'morning' | 'evening' | 'double' | 'off'
+    position = Column(String, nullable=True)   # 'מטבח' | 'פס' | 'גריל'
+    note = Column(Text, nullable=True)
 
     business = relationship("Business")
     user = relationship("User")
