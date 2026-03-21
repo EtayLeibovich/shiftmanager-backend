@@ -817,6 +817,46 @@ def get_personal_stats(passcode: str, db: Session = Depends(get_db)):
 # ==========================================
 # DASHBOARD (admin)
 # ==========================================
+@app.get("/dashboard/charts/{business_id}")
+def get_dashboard_charts(business_id: int, db: Session = Depends(get_db)):
+    from datetime import timedelta
+    now = datetime.now()
+    users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
+
+    # שעות עבודה לפי יום — 7 ימים אחרונים
+    days_labels, days_hours = [], []
+    day_names = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת']
+    for i in range(6, -1, -1):
+        day = now - timedelta(days=i)
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day.replace(hour=23, minute=59, second=59)
+        hours = db.query(func.sum(models.Shift.total_hours)).filter(
+            models.Shift.user_id.in_(users_sub),
+            models.Shift.clock_in >= day_start,
+            models.Shift.clock_in <= day_end,
+        ).scalar() or 0.0
+        days_labels.append(day_names[day.weekday() % 7] if day.weekday() != 6 else 'שבת')
+        days_hours.append(round(hours, 1))
+
+    # top 5 עובדים לפי שעות החודש
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    employees = db.query(models.User).filter(models.User.business_id == business_id, models.User.role != 'manager').all()
+    emp_data = []
+    for emp in employees:
+        h = db.query(func.sum(models.Shift.total_hours)).filter(
+            models.Shift.user_id == emp.id,
+            models.Shift.clock_in >= month_start,
+        ).scalar() or 0.0
+        if h > 0:
+            emp_data.append({"name": emp.full_name, "hours": round(h, 1)})
+    emp_data.sort(key=lambda x: x["hours"], reverse=True)
+
+    return {
+        "weekly": {"labels": days_labels, "hours": days_hours},
+        "top_employees": emp_data[:5],
+    }
+
+
 @app.get("/dashboard/stats/{business_id}")
 def get_dashboard_stats(business_id: int, db: Session = Depends(get_db)):
     users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
