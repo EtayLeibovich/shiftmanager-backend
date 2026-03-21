@@ -150,7 +150,27 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN totp_secret TEXT",
             "ALTER TABLE users ADD COLUMN is_2fa_enabled INTEGER DEFAULT 0",
         ]
-    for m in migrations:
+    # explicit table creation for new tables (fallback if create_all misses them)
+    table_migrations = [
+        """CREATE TABLE IF NOT EXISTS shift_roster (
+            id SERIAL PRIMARY KEY,
+            business_id INTEGER REFERENCES businesses(id),
+            user_id INTEGER REFERENCES users(id),
+            week_start DATE,
+            day_of_week INTEGER,
+            shift_type VARCHAR
+        )""",
+        """CREATE TABLE IF NOT EXISTS shift_preferences (
+            id SERIAL PRIMARY KEY,
+            business_id INTEGER REFERENCES businesses(id),
+            user_id INTEGER REFERENCES users(id),
+            week_start DATE,
+            day_of_week INTEGER,
+            preference VARCHAR
+        )""",
+    ] if is_postgres else []
+
+    for m in migrations + table_migrations:
         with engine.connect() as conn:
             try:
                 conn.execute(text(m))
