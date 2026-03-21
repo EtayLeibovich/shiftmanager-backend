@@ -47,8 +47,8 @@ class User(Base):
     email = Column(String, nullable=True)
     is_active = Column(Boolean, default=True, nullable=True)
     approval_status = Column(String, default="approved", nullable=True)  # 'pending' | 'approved' | 'rejected'
-    totp_secret = Column(String, nullable=True)          # TOTP secret key (encrypted at rest via DB-level AES in prod)
-    is_2fa_enabled = Column(Boolean, default=False, nullable=True)
+    totp_secret = Column(String, nullable=True)
+    is_2fa_enabled = Column(Integer, default=0, nullable=True)
 
     business = relationship("Business", back_populates="users")
     branch = relationship("Branch", back_populates="users", foreign_keys=[branch_id])

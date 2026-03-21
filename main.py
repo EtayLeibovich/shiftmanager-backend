@@ -132,13 +132,11 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS branch_id INTEGER",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passcode_hash TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'approved'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE users ALTER COLUMN is_2fa_enabled TYPE BOOLEAN USING is_2fa_enabled::boolean",
-            "ALTER TABLE users ALTER COLUMN is_active TYPE BOOLEAN USING is_active::boolean",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled INTEGER DEFAULT 0",
         ]
     else:
         migrations = [
@@ -445,7 +443,7 @@ def setup_2fa(current_user: models.User = Depends(get_setup_user), db: Session =
     )
     # Persist the new secret (not yet enabled) so verify-2fa can read it
     current_user.totp_secret = secret
-    current_user.is_2fa_enabled = False  # only activated after successful verify
+    current_user.is_2fa_enabled = 0  # only activated after successful verify
     db.commit()
 
     setup_token = auth.create_pending_token({
@@ -503,7 +501,7 @@ def verify_2fa(body: schemas.TwoFactorVerifyRequest, db: Session = Depends(get_d
 
         # 7. Setup flow: activate 2FA and issue full token
         if scope == "2fa_setup":
-            user.is_2fa_enabled = True
+            user.is_2fa_enabled = 1
             db.commit()
             token = auth.create_access_token({"user_id": user.id, "business_id": user.business_id, "role": user.role})
             return {"access_token": token, "token_type": "bearer", "setup_complete": True, "user": user_data}
@@ -528,7 +526,7 @@ def get_2fa_status(current_user: models.User = Depends(get_current_user)):
 @app.post("/auth/disable-2fa")
 def disable_2fa(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Disables 2FA for the authenticated user and clears the TOTP secret."""
-    current_user.is_2fa_enabled = False
+    current_user.is_2fa_enabled = 0
     current_user.totp_secret = None
     db.commit()
     return {"success": True, "message": "אימות דו-שלבי כובה"}
