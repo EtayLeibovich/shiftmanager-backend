@@ -1385,3 +1385,67 @@ def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
         return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"answer": f"שגיאת AI: {str(e)}"}
+
+
+@app.post("/ai/employee-ask")
+def employee_ai_ask(payload: dict, db: Session = Depends(get_db)):
+    passcode = payload.get("passcode")
+    query = payload.get("query")
+    history = payload.get("history", [])
+
+    user = db.query(models.User).filter(models.User.passcode == passcode).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+
+    # משמרות אחרונות של העובד
+    shifts = db.query(models.Shift).filter(models.Shift.user_id == user.id).order_by(models.Shift.clock_in.desc()).limit(20).all()
+    shifts_text = "\n".join([
+        f"- {s.clock_in.strftime('%d/%m/%Y %H:%M')} עד {s.clock_out.strftime('%H:%M') if s.clock_out else 'עדיין פתוח'} ({s.total_hours or '?'} שעות)"
+        for s in shifts
+    ]) or "אין משמרות"
+
+    # משמרות מתוכננות
+    from datetime import datetime
+    upcoming = db.query(models.ScheduledShift).filter(
+        models.ScheduledShift.user_id == user.id,
+        models.ScheduledShift.start_time >= datetime.now()
+    ).order_by(models.ScheduledShift.start_time).limit(10).all()
+    upcoming_text = "\n".join([
+        f"- {s.start_time.strftime('%d/%m/%Y %H:%M')} עד {s.end_time.strftime('%H:%M')}"
+        for s in upcoming
+    ]) or "אין משמרות מתוכננות"
+
+    # בקשות חופש
+    leaves = db.query(models.LeaveRequest).filter(models.LeaveRequest.user_id == user.id).order_by(models.LeaveRequest.created_at.desc()).limit(5).all()
+    leaves_text = "\n".join([
+        f"- {l.leave_type} מ-{l.start_date} עד {l.end_date} — {l.status}"
+        for l in leaves
+    ]) or "אין בקשות חופש"
+
+    system_prompt = (
+        f"אתה עוזר AI אישי של העובד {user.full_name}. ענה בעברית בצורה ידידותית וקצרה.\n"
+        f"אתה רואה רק את הנתונים של {user.full_name} — לא של עובדים אחרים.\n\n"
+        f"**20 המשמרות האחרונות:**\n{shifts_text}\n\n"
+        f"**משמרות מתוכננות קרובות:**\n{upcoming_text}\n\n"
+        f"**בקשות חופש:**\n{leaves_text}"
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history:
+        if msg.get("role") == "user":
+            messages.append({"role": "user", "content": msg.get("content", "")})
+        elif msg.get("role") == "model":
+            messages.append({"role": "assistant", "content": msg.get("content", "")})
+    messages.append({"role": "user", "content": query})
+
+    try:
+        if not _groq_client:
+            return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר."}
+        response = _groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=512,
+        )
+        return {"answer": response.choices[0].message.content}
+    except Exception as e:
+        return {"answer": f"שגיאת AI: {str(e)}"}
