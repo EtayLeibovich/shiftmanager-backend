@@ -1558,14 +1558,70 @@ def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db))
         models.ShiftRoster.week_start == week
     ).all()
     days_map = {e.day_of_week: e.shift_type for e in entries}
+    prefs = db.query(models.ShiftPreference).filter(
+        models.ShiftPreference.user_id == user.id,
+        models.ShiftPreference.week_start == week
+    ).all()
+    prefs_map = {p.day_of_week: p.preference for p in prefs}
     return {
         "week_start": week_start,
         "name": user.full_name,
         "days": [
             {"day": d, "day_name": DAY_NAMES[d], "shift_type": days_map.get(d, "off"),
+             "preference": prefs_map.get(d),
              "label": SHIFT_TIMES[days_map.get(d, "off")]["label"],
              "start": SHIFT_TIMES[days_map.get(d, "off")]["start"],
              "end": SHIFT_TIMES[days_map.get(d, "off")]["end"]}
             for d in range(7)
         ]
     }
+
+
+@app.post("/roster/preference")
+def submit_preference(payload: dict, db: Session = Depends(get_db)):
+    """עובד מגיש העדפת משמרת ליום שלא סוידר"""
+    from datetime import date as date_type
+    passcode = payload.get("passcode")
+    week_start = payload.get("week_start")
+    day = payload.get("day")
+    preference = payload.get("preference")
+
+    if preference not in ("morning", "evening", "double"):
+        raise HTTPException(status_code=400, detail="העדפה לא תקינה")
+
+    user = db.query(models.User).filter(models.User.passcode == passcode).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+
+    week = date_type.fromisoformat(week_start)
+
+    # מחק העדפה קיימת לאותו יום ושמור חדשה
+    db.query(models.ShiftPreference).filter(
+        models.ShiftPreference.user_id == user.id,
+        models.ShiftPreference.week_start == week,
+        models.ShiftPreference.day_of_week == day
+    ).delete()
+    db.add(models.ShiftPreference(
+        business_id=user.business_id, user_id=user.id,
+        week_start=week, day_of_week=day, preference=preference
+    ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/roster/preferences/{business_id}")
+def get_preferences(business_id: int, week_start: str, db: Session = Depends(get_db)):
+    """מנהל רואה את כל ההעדפות של העובדים לשבוע"""
+    from datetime import date as date_type
+    week = date_type.fromisoformat(week_start)
+    prefs = db.query(models.ShiftPreference, models.User).join(
+        models.User, models.ShiftPreference.user_id == models.User.id
+    ).filter(
+        models.ShiftPreference.business_id == business_id,
+        models.ShiftPreference.week_start == week
+    ).all()
+    return [
+        {"user_id": p.ShiftPreference.user_id, "name": p.User.full_name,
+         "day": p.ShiftPreference.day_of_week, "preference": p.ShiftPreference.preference}
+        for p in prefs
+    ]
