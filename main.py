@@ -1523,49 +1523,6 @@ SHIFT_TIMES = {
 DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 
 
-@app.get("/roster/{business_id}")
-def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db)):
-    from datetime import date as date_type
-    week = date_type.fromisoformat(week_start)
-    employees = db.query(models.User).filter(
-        models.User.business_id == business_id,
-        models.User.role != "manager",
-        models.User.is_active != None
-    ).order_by(models.User.full_name).all()
-    entries = db.query(models.ShiftRoster).filter(
-        models.ShiftRoster.business_id == business_id,
-        models.ShiftRoster.week_start == week
-    ).all()
-    roster_map = {(e.user_id, e.day_of_week): e.shift_type for e in entries}
-    return {
-        "week_start": week_start,
-        "employees": [
-            {"id": emp.id, "name": emp.full_name,
-             "days": [roster_map.get((emp.id, d), "off") for d in range(7)]}
-            for emp in employees
-        ]
-    }
-
-
-@app.post("/roster/{business_id}")
-def save_roster(business_id: int, payload: dict, db: Session = Depends(get_db)):
-    from datetime import date as date_type
-    week = date_type.fromisoformat(payload["week_start"])
-    entries = payload.get("entries", [])
-    db.query(models.ShiftRoster).filter(
-        models.ShiftRoster.business_id == business_id,
-        models.ShiftRoster.week_start == week
-    ).delete()
-    for e in entries:
-        if e.get("shift_type") and e["shift_type"] != "off":
-            db.add(models.ShiftRoster(
-                business_id=business_id, user_id=e["user_id"],
-                week_start=week, day_of_week=e["day"], shift_type=e["shift_type"]
-            ))
-    db.commit()
-    return {"ok": True}
-
-
 @app.get("/roster/my-week/{passcode}")
 def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db)):
     from datetime import date as date_type
@@ -1615,7 +1572,6 @@ def submit_preference(payload: dict, db: Session = Depends(get_db)):
 
     week = date_type.fromisoformat(week_start)
 
-    # מחק העדפה קיימת לאותו יום ושמור חדשה
     db.query(models.ShiftPreference).filter(
         models.ShiftPreference.user_id == user.id,
         models.ShiftPreference.week_start == week,
@@ -1645,3 +1601,48 @@ def get_preferences(business_id: int, week_start: str, db: Session = Depends(get
          "day": p.ShiftPreference.day_of_week, "preference": p.ShiftPreference.preference}
         for p in prefs
     ]
+
+
+@app.get("/roster/{business_id}")
+def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db)):
+    from datetime import date as date_type
+    week = date_type.fromisoformat(week_start)
+    employees = db.query(models.User).filter(
+        models.User.business_id == business_id,
+        models.User.role != "manager",
+        models.User.is_active != None
+    ).order_by(models.User.full_name).all()
+    entries = db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.business_id == business_id,
+        models.ShiftRoster.week_start == week
+    ).all()
+    roster_map = {(e.user_id, e.day_of_week): e.shift_type for e in entries}
+    return {
+        "week_start": week_start,
+        "employees": [
+            {"id": emp.id, "name": emp.full_name,
+             "days": [roster_map.get((emp.id, d), "off") for d in range(7)]}
+            for emp in employees
+        ]
+    }
+
+
+@app.post("/roster/{business_id}")
+def save_roster(business_id: int, payload: dict, db: Session = Depends(get_db)):
+    from datetime import date as date_type
+    week = date_type.fromisoformat(payload["week_start"])
+    entries = payload.get("entries", [])
+    db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.business_id == business_id,
+        models.ShiftRoster.week_start == week
+    ).delete()
+    for e in entries:
+        if e.get("shift_type") and e["shift_type"] != "off":
+            db.add(models.ShiftRoster(
+                business_id=business_id, user_id=e["user_id"],
+                week_start=week, day_of_week=e["day"], shift_type=e["shift_type"]
+            ))
+    db.commit()
+    return {"ok": True}
+
+
