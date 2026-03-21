@@ -1510,7 +1510,7 @@ def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db))
     employees = db.query(models.User).filter(
         models.User.business_id == business_id,
         models.User.role != "manager",
-        models.User.is_active == 1
+        models.User.is_active != None
     ).order_by(models.User.full_name).all()
     entries = db.query(models.ShiftRoster).filter(
         models.ShiftRoster.business_id == business_id,
