@@ -58,6 +58,21 @@ class User(Base):
     notifications = relationship("Notification", back_populates="user")
 
 
+class ShiftRoster(Base):
+    """סידור עבודה שבועי — מנהל קובע לכל עובד משמרת לכל יום"""
+    __tablename__ = "shift_roster"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))
+    week_start = Column(Date)           # תאריך ראשון של השבוע (ראשון)
+    day_of_week = Column(Integer)       # 0=ראשון, 1=שני, ..., 6=שבת
+    shift_type = Column(String)         # 'morning' | 'evening' | 'double' | 'off'
+
+    business = relationship("Business")
+    user = relationship("User")
+
+
 class Shift(Base):
     __tablename__ = "shifts"
 

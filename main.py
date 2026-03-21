@@ -1489,3 +1489,83 @@ def employee_ai_ask(payload: dict, db: Session = Depends(get_db)):
         return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"answer": f"שגיאת AI: {str(e)}"}
+
+
+# ==========================================
+# SHIFT ROSTER — סידור עבודה שבועי
+# ==========================================
+SHIFT_TIMES = {
+    "morning": {"label": "בוקר",  "start": "10:30", "end": "18:00"},
+    "evening": {"label": "ערב",   "start": "18:00", "end": "23:00"},
+    "double":  {"label": "כפולה", "start": "10:30", "end": "23:00"},
+    "off":     {"label": "חופש",  "start": None,    "end": None},
+}
+DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
+
+
+@app.get("/roster/{business_id}")
+def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db)):
+    from datetime import date as date_type
+    week = date_type.fromisoformat(week_start)
+    employees = db.query(models.User).filter(
+        models.User.business_id == business_id,
+        models.User.role != "manager",
+        models.User.is_active == 1
+    ).order_by(models.User.full_name).all()
+    entries = db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.business_id == business_id,
+        models.ShiftRoster.week_start == week
+    ).all()
+    roster_map = {(e.user_id, e.day_of_week): e.shift_type for e in entries}
+    return {
+        "week_start": week_start,
+        "employees": [
+            {"id": emp.id, "name": emp.full_name,
+             "days": [roster_map.get((emp.id, d), "off") for d in range(7)]}
+            for emp in employees
+        ]
+    }
+
+
+@app.post("/roster/{business_id}")
+def save_roster(business_id: int, payload: dict, db: Session = Depends(get_db)):
+    from datetime import date as date_type
+    week = date_type.fromisoformat(payload["week_start"])
+    entries = payload.get("entries", [])
+    db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.business_id == business_id,
+        models.ShiftRoster.week_start == week
+    ).delete()
+    for e in entries:
+        if e.get("shift_type") and e["shift_type"] != "off":
+            db.add(models.ShiftRoster(
+                business_id=business_id, user_id=e["user_id"],
+                week_start=week, day_of_week=e["day"], shift_type=e["shift_type"]
+            ))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/roster/my-week/{passcode}")
+def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db)):
+    from datetime import date as date_type
+    user = db.query(models.User).filter(models.User.passcode == passcode).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    week = date_type.fromisoformat(week_start)
+    entries = db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.user_id == user.id,
+        models.ShiftRoster.week_start == week
+    ).all()
+    days_map = {e.day_of_week: e.shift_type for e in entries}
+    return {
+        "week_start": week_start,
+        "name": user.full_name,
+        "days": [
+            {"day": d, "day_name": DAY_NAMES[d], "shift_type": days_map.get(d, "off"),
+             "label": SHIFT_TIMES[days_map.get(d, "off")]["label"],
+             "start": SHIFT_TIMES[days_map.get(d, "off")]["start"],
+             "end": SHIFT_TIMES[days_map.get(d, "off")]["end"]}
+            for d in range(7)
+        ]
+    }
