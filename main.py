@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import models
 import schemas
 import auth
+import ai_agent
 from database import engine, get_db
 from groq import Groq
 from passlib.context import CryptContext
@@ -1393,62 +1394,36 @@ def export_monthly_csv(
 # AI ASSISTANT
 # ==========================================
 @app.post("/ai/manager-ask")
-def manager_ai_ask(payload: dict, db: Session = Depends(get_db)):
-    business_id = payload.get("business_id")
-    query = payload.get("query")
-    history = payload.get("history", [])  # היסטוריית שיחה מהצד הלקוח
-
-    users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
-
-    # נתוני עובדים
-    workers = db.query(models.User).filter(models.User.business_id == business_id).all()
-    workers_context = "\n".join([
-        f"- {w.full_name} (תפקיד: {w.role}, תעריף: {w.hourly_rate or 0}₪/שעה)"
-        for w in workers
-    ])
-
-    # משמרות אחרונות
-    shifts = (
-        db.query(models.Shift, models.User)
-        .join(models.User)
-        .filter(models.Shift.user_id.in_(users_sub))
-        .order_by(models.Shift.clock_in.desc())
-        .limit(50)
-        .all()
-    )
-    shifts_context = "\n".join([
-        f"- {s.User.full_name}: {s.Shift.clock_in.strftime('%d/%m/%Y %H:%M')} | {s.Shift.total_hours or 'פתוח'} שעות"
-        for s in shifts
-    ])
-
-    system_prompt = (
-        f"אתה עוזר AI חכם של מנהל עסק. ענה בעברית בצורה ברורה וממוקדת.\n\n"
-        f"**עובדים בעסק:**\n{workers_context}\n\n"
-        f"**50 המשמרות האחרונות:**\n{shifts_context}"
-    )
-
-    # בנה היסטוריית שיחה לפורמט של Groq (OpenAI-compatible)
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in history:
-        role = msg.get("role")
-        content = msg.get("content", "")
-        if role == "user":
-            messages.append({"role": "user", "content": content})
-        elif role == "model":
-            messages.append({"role": "assistant", "content": content})
-    messages.append({"role": "user", "content": query})
-
+def manager_ai_ask(payload: dict, manager: dict = Depends(get_manager_payload), db: Session = Depends(get_db)):
+    # SECURITY: business_id comes from the signed token, never from the request body
+    business_id = manager["business_id"]
+    query = (payload.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    if not _groq_client:
+        return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר בסביבה.", "pending_actions": []}
     try:
-        if not _groq_client:
-            return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר בסביבה."}
-        response = _groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=1024,
+        return ai_agent.run_agent(
+            _groq_client, db, business_id, query,
+            payload.get("history", []), calc_salary=calc_shift_salary,
         )
-        return {"answer": response.choices[0].message.content}
     except Exception as e:
-        return {"answer": f"שגיאת AI: {str(e)}"}
+        return {"answer": f"שגיאת AI: {str(e)}", "pending_actions": []}
+
+
+class AIActionRequest(BaseModel):
+    tool: str
+    args: dict
+
+
+@app.post("/ai/execute-action")
+def ai_execute_action(req: AIActionRequest, manager: dict = Depends(get_manager_payload), db: Session = Depends(get_db)):
+    """מבצע פעולה שהסוכן הציע — רק אחרי שהמנהל לחץ 'אשר' בממשק."""
+    try:
+        desc = ai_agent.execute_action(db, manager["business_id"], req.tool, req.args, create_notification)
+    except ai_agent.ToolError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "description": desc}
 
 
 @app.post("/ai/employee-ask")
