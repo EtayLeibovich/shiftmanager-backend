@@ -5,9 +5,12 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # בסביבת production (Render) משתמש ב-DATABASE_URL, אחרת SQLite מקומי
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./shift_manager.db")
 
-# Render נותן postgres:// אבל SQLAlchemy צריך postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Render/Neon נותנים postgres:// או postgresql://. מציינים במפורש את הדרייבר psycopg2
+# (SQLAlchemy 2.1 עבר כברירת מחדל ל-psycopg 3, שלא מותקן אצלנו).
+for _prefix in ("postgres://", "postgresql://"):
+    if DATABASE_URL.startswith(_prefix):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_prefix):]
+        break
 
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
