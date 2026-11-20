@@ -11,6 +11,7 @@ import models
 import schemas
 import auth
 import ai_agent
+import demo
 from database import engine, get_db
 from groq import Groq
 from passlib.context import CryptContext
@@ -554,6 +555,7 @@ def setup_2fa(current_user: models.User = Depends(get_setup_user), db: Session =
     and verify a valid code via /auth/verify-2fa to activate 2FA. This prevents lockout
     if the user abandons the setup flow midway.
     """
+    block_in_demo(db, current_user.business_id, "שינוי אימות דו-שלבי")
     secret = pyotp.random_base32()
     provisioning_uri = pyotp.TOTP(secret).provisioning_uri(
         name=current_user.full_name,
@@ -644,6 +646,7 @@ def get_2fa_status(current_user: models.User = Depends(get_current_user)):
 @app.post("/auth/disable-2fa")
 def disable_2fa(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Disables 2FA for the authenticated user and clears the TOTP secret."""
+    block_in_demo(db, current_user.business_id, "שינוי אימות דו-שלבי")
     current_user.is_2fa_enabled = 0
     current_user.totp_secret = None
     db.commit()
@@ -653,6 +656,50 @@ def disable_2fa(current_user: models.User = Depends(get_current_user), db: Sessi
 @app.post("/users/login", response_model=schemas.UserResponse)
 def login(creds: schemas.LoginRequest, db: Session = Depends(get_db)):
     return authenticate(db, creds.full_name, creds.passcode)
+
+
+# ==========================================
+# DEMO MODE — כניסה בלי סיסמה לעסק לדוגמה (לקישור בקורות חיים)
+# ==========================================
+DEMO_ENABLED = os.getenv("DEMO_ENABLED", "1") == "1"
+DEMO_AI_PER_HOUR = 40
+_demo_ai_calls: list = []
+
+
+def demo_ai_guard(db: Session, business_id: int):
+    """מגביל קריאות AI בעסק הדמו, כדי שגולשים אנונימיים לא ינצלו את מכסת Groq."""
+    if not demo.is_demo_business(db, business_id):
+        return
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    _demo_ai_calls[:] = [t for t in _demo_ai_calls if t > cutoff]
+    if len(_demo_ai_calls) >= DEMO_AI_PER_HOUR:
+        raise HTTPException(status_code=429, detail="בהדגמה יש מגבלת שאלות לשעה. נסה שוב מאוחר יותר")
+    _demo_ai_calls.append(datetime.utcnow())
+
+
+def block_in_demo(db: Session, business_id: int, what: str):
+    if demo.is_demo_business(db, business_id):
+        raise HTTPException(status_code=403, detail=f"{what} לא זמין במצב הדגמה")
+
+
+class DemoLoginRequest(BaseModel):
+    role: str = "manager"  # 'manager' | 'worker'
+
+
+@app.post("/demo/login")
+def demo_login(req: DemoLoginRequest, db: Session = Depends(get_db)):
+    if not DEMO_ENABLED:
+        raise HTTPException(status_code=404, detail="מצב הדגמה כבוי")
+    role = "manager" if req.role == "manager" else "worker"
+    biz = demo.ensure_demo(db, hash_passcode, now_israel())
+    user = demo.demo_user(db, biz, role)
+    token = auth.create_access_token({
+        "user_id": user.id, "business_id": user.business_id, "role": user.role, "demo": True,
+    })
+    return {
+        "access_token": token, "token_type": "bearer",
+        "user": {"id": user.id, "business_id": user.business_id, "full_name": user.full_name, "role": user.role},
+    }
 
 
 # ==========================================
@@ -686,6 +733,7 @@ def get_join_code(business_id: int, manager: models.User = Depends(require_manag
 @app.post("/businesses/{business_id}/regenerate-code")
 def regenerate_join_code(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     check_business(manager, business_id)
+    block_in_demo(db, business_id, "החלפת קוד הצטרפות")
     biz = db.query(models.Business).filter(models.Business.id == business_id).first()
     if not biz:
         raise HTTPException(status_code=404, detail="Business not found")
@@ -1559,6 +1607,7 @@ def manager_ai_ask(payload: dict, manager: dict = Depends(get_manager_payload), 
     query = (payload.get("query") or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
+    demo_ai_guard(db, business_id)
     if not _groq_client:
         return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר בסביבה.", "pending_actions": []}
     try:
@@ -1591,6 +1640,7 @@ def employee_ai_ask(payload: dict, user: models.User = Depends(get_current_user)
     history = payload.get("history", [])
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
+    demo_ai_guard(db, user.business_id)
 
     # משמרות אחרונות של העובד
     shifts = db.query(models.Shift).filter(models.Shift.user_id == user.id).order_by(models.Shift.clock_in.desc()).limit(20).all()
@@ -1636,11 +1686,7 @@ def employee_ai_ask(payload: dict, user: models.User = Depends(get_current_user)
     try:
         if not _groq_client:
             return {"answer": "שגיאת AI: GROQ_API_KEY לא מוגדר."}
-        response = _groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=512,
-        )
+        response = _groq_client.chat.completions.create(messages=messages, **ai_agent.completion_kwargs())
         return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"answer": f"שגיאת AI: {str(e)}"}

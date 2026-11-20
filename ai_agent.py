@@ -7,6 +7,7 @@
 /ai/execute-action, שמריץ את execute_action().
 """
 import json
+import os
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,7 +17,18 @@ from sqlalchemy.orm import Session
 import models
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
-MODEL = "llama-3.3-70b-versatile"
+# Groq retires models periodically (llama-3.3-70b-versatile was shut down 2026-08-16).
+# Override without a code change via the GROQ_MODEL env var on Render.
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+
+def completion_kwargs() -> dict:
+    """Model-specific options. gpt-oss is a reasoning model: keep reasoning light so the
+    token budget goes to the answer, not to hidden thinking."""
+    kw = {"model": MODEL, "temperature": 0.2, "max_tokens": 2048}
+    if MODEL.startswith("openai/gpt-oss"):
+        kw["reasoning_effort"] = "low"
+    return kw
 MAX_STEPS = 6
 
 DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
@@ -316,8 +328,7 @@ def run_agent(client, db: Session, business_id: int, query: str, history: list, 
     pending = []
     for _ in range(MAX_STEPS):
         resp = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOL_DEFS,
-            tool_choice="auto", max_tokens=1024, temperature=0.2,
+            messages=messages, tools=TOOL_DEFS, tool_choice="auto", **completion_kwargs(),
         )
         msg = resp.choices[0].message
         if not msg.tool_calls:
