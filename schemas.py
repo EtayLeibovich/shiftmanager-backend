@@ -80,7 +80,9 @@ class UserResponse(BaseModel):
 # ==========================================
 # Shift
 # ==========================================
-class ShiftAction(BaseModel):
+class LoginRequest(BaseModel):
+    """זיהוי לפי שם מלא + סיסמה. הסיסמה לבדה אינה מזהה משתמש."""
+    full_name: str
     passcode: str
 
 
@@ -133,7 +135,6 @@ class ScheduledShiftResponse(BaseModel):
 # Leave Request
 # ==========================================
 class LeaveRequestCreate(BaseModel):
-    passcode: str
     leave_type: str = "vacation"
     start_date: date
     end_date: date

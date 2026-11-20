@@ -98,11 +98,103 @@ def get_current_user(authorization: str = Header(None), db: Session = Depends(ge
     payload = auth.verify_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="טוקן לא תקף או פג תוקף")
-    if payload.get("scope") in ("2fa_pending", "2fa_setup"):
+    if payload.get("scope") in ("2fa_pending", "2fa_setup", "setup_required"):
         raise HTTPException(status_code=401, detail="נדרש אימות 2FA להשלמת ההתחברות")
     user = db.query(models.User).filter(models.User.id == payload["user_id"]).first()
     if not user:
         raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="החשבון מושבת")
+    return user
+
+
+def require_manager(user: models.User = Depends(get_current_user)) -> models.User:
+    """FastAPI dependency: רק מנהל מחובר."""
+    if user.role != "manager":
+        raise HTTPException(status_code=403, detail="פעולה זו מותרת למנהל בלבד")
+    return user
+
+
+def check_business(user: models.User, business_id: int):
+    """מוודא שהמשתמש המחובר ניגש רק לנתונים של העסק שלו."""
+    if user.business_id != business_id:
+        raise HTTPException(status_code=403, detail="אין גישה לעסק זה")
+
+
+# ---------------------------------------------------------------------------
+# זיהוי משתמש: שם מלא + סיסמה
+# ---------------------------------------------------------------------------
+MIN_PASSCODE_LEN = 4
+MAX_FAILED_LOGINS = 5
+LOCKOUT_MINUTES = 5
+_failed_logins: dict = {}  # name_key -> {"count": int, "until": datetime|None}
+
+
+def normalize_name(name: str) -> str:
+    """'  דניאל   כהן ' -> 'דניאל כהן'"""
+    return " ".join((name or "").split())
+
+
+def _name_key(name: str) -> str:
+    return normalize_name(name).lower()
+
+
+def _users_by_name(db: Session, full_name: str):
+    return db.query(models.User).filter(
+        func.lower(func.trim(models.User.full_name)) == _name_key(full_name)
+    ).all()
+
+
+def validate_passcode(passcode: str):
+    if not passcode or len(passcode) < MIN_PASSCODE_LEN:
+        raise HTTPException(status_code=400, detail=f"הסיסמה חייבת להכיל לפחות {MIN_PASSCODE_LEN} תווים")
+
+
+def ensure_unique_credentials(db: Session, full_name: str, passcode: str, exclude_id: Optional[int] = None):
+    """
+    שני עובדים יכולים לחלוק שם או סיסמה — אבל לא את שניהם.
+    כך הצירוף שם+סיסמה תמיד מזהה משתמש אחד בלבד.
+    """
+    for u in _users_by_name(db, full_name):
+        if u.id == exclude_id:
+            continue
+        if verify_passcode(passcode, u, db):
+            raise HTTPException(
+                status_code=400,
+                detail="כבר קיים משתמש עם אותו שם ואותה סיסמה — בחר סיסמה אחרת",
+            )
+
+
+def authenticate(db: Session, full_name: str, passcode: str) -> models.User:
+    """מאתר משתמש לפי שם מלא ומאמת את הסיסמה שלו. כולל נעילה זמנית אחרי ניסיונות שגויים."""
+    name = normalize_name(full_name)
+    if not name or not passcode:
+        raise HTTPException(status_code=400, detail="יש להזין שם מלא וסיסמה")
+    key = _name_key(name)
+    now = datetime.utcnow()
+    rec = _failed_logins.get(key)
+    if rec and rec["until"] and rec["until"] > now:
+        mins = max(1, int((rec["until"] - now).total_seconds() // 60) + 1)
+        raise HTTPException(status_code=429, detail=f"יותר מדי ניסיונות שגויים. נסה שוב בעוד {mins} דקות")
+
+    matches = [u for u in _users_by_name(db, name) if verify_passcode(passcode, u, db)]
+    if len(matches) != 1:
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail="נמצאו כמה משתמשים עם אותם פרטים — פנה למנהל")
+        rec = _failed_logins.setdefault(key, {"count": 0, "until": None})
+        rec["count"] += 1
+        if rec["count"] >= MAX_FAILED_LOGINS:
+            rec["count"], rec["until"] = 0, now + timedelta(minutes=LOCKOUT_MINUTES)
+        raise HTTPException(status_code=401, detail="שם או סיסמה שגויים")
+
+    _failed_logins.pop(key, None)
+    user = matches[0]
+    if user.approval_status == "pending":
+        raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
+    if user.approval_status == "rejected":
+        raise HTTPException(status_code=403, detail="הבקשה נדחתה על ידי המנהל")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="החשבון מושבת — פנה למנהל")
     return user
 
 
@@ -209,18 +301,25 @@ def auto_seed():
                 business_id=biz.id,
                 full_name="מנהל ראשי",
                 role="manager",
-                passcode=default_passcode,
-                # SECURITY: store bcrypt hash — never authenticate against plaintext in DB
+                passcode=None,
+                # SECURITY: store bcrypt hash only — never keep plaintext in DB
                 passcode_hash=hash_passcode(default_passcode),
                 is_active=True,
                 approval_status="approved",
             )
             db.add(manager)
             db.commit()
-        elif manager.passcode_hash is None:
-            # Lazy migration: upgrade existing manager to bcrypt hash
-            manager.passcode_hash = hash_passcode(manager.passcode)
-            db.commit()
+
+        # SECURITY migration: hash any legacy plaintext passcodes, then wipe the plaintext.
+        for u in db.query(models.User).filter(models.User.passcode != None).all():
+            if not u.passcode_hash:
+                u.passcode_hash = hash_passcode(u.passcode)
+            u.passcode = None
+        # Normalize names so name lookups are consistent.
+        for u in db.query(models.User).all():
+            if u.full_name and u.full_name != normalize_name(u.full_name):
+                u.full_name = normalize_name(u.full_name)
+        db.commit()
     finally:
         db.close()
 
@@ -312,7 +411,7 @@ def setup_init(db: Session = Depends(get_db)):
             business_id=biz.id,
             full_name="מנהל ראשי",
             role="manager",
-            passcode=default_passcode,
+            passcode=None,
             passcode_hash=hash_passcode(default_passcode),
             is_active=True,
             approval_status="approved",
@@ -354,19 +453,17 @@ def register_employee(req: RegisterRequest, db: Session = Depends(get_db)):
     biz = db.query(models.Business).filter(models.Business.join_code == req.join_code.upper()).first()
     if not biz:
         raise HTTPException(status_code=404, detail="קוד עסק לא נמצא")
-    # בדוק שהקוד האישי לא תפוס
-    existing = db.query(models.User).filter(
-        models.User.passcode == req.passcode,
-        models.User.business_id == biz.id
-    ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="קוד אישי תפוס, בחר קוד אחר")
+    full_name = normalize_name(req.full_name)
+    if len(full_name.split()) < 2:
+        raise HTTPException(status_code=400, detail="יש להזין שם מלא (שם פרטי ושם משפחה)")
+    validate_passcode(req.passcode)
+    ensure_unique_credentials(db, full_name, req.passcode)
     new_user = models.User(
         business_id=biz.id,
-        full_name=req.full_name,
+        full_name=full_name,
         role="worker",
-        passcode=req.passcode,
-        passcode_hash=hash_passcode(req.passcode),  # SECURITY: store bcrypt hash
+        passcode=None,
+        passcode_hash=hash_passcode(req.passcode),  # SECURITY: store bcrypt hash only
         phone=req.phone,
         email=req.email,
         is_active=False,
@@ -377,13 +474,14 @@ def register_employee(req: RegisterRequest, db: Session = Depends(get_db)):
     db.refresh(new_user)
     create_notification(
         db, biz.id, "registration_pending",
-        f"🆕 {req.full_name} מבקש להצטרף לעסק - ממתין לאישורך"
+        f"🆕 {full_name} מבקש להצטרף לעסק - ממתין לאישורך"
     )
     return {"message": "הבקשה נשלחה! המנהל יאשר אותך בקרוב.", "user_id": new_user.id}
 
 
 @app.get("/register/pending/{business_id}")
-def get_pending_registrations(business_id: int, db: Session = Depends(get_db)):
+def get_pending_registrations(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     users = db.query(models.User).filter(
         models.User.business_id == business_id,
         models.User.approval_status == "pending"
@@ -393,10 +491,11 @@ def get_pending_registrations(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/register/{user_id}/approve")
-def approve_registration(user_id: int, db: Session = Depends(get_db)):
+def approve_registration(user_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="משתמש לא נמצא")
+    check_business(manager, user.business_id)
     user.approval_status = "approved"
     user.is_active = True
     db.commit()
@@ -409,10 +508,11 @@ def approve_registration(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/register/{user_id}/reject")
-def reject_registration(user_id: int, db: Session = Depends(get_db)):
+def reject_registration(user_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="משתמש לא נמצא")
+    check_business(manager, user.business_id)
     user.approval_status = "rejected"
     user.is_active = False
     db.commit()
@@ -420,16 +520,9 @@ def reject_registration(user_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/auth/token")
-def login_token(action: schemas.ShiftAction, db: Session = Depends(get_db)):
-    # Look up by passcode identifier, then verify via bcrypt hash
-    user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    # SECURITY: use constant-time hash verification to prevent timing attacks
-    if not user or not verify_passcode(action.passcode, user, db):
-        raise HTTPException(status_code=401, detail="קוד שגוי")
-    if user.approval_status == "pending":
-        raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
-    if user.approval_status == "rejected":
-        raise HTTPException(status_code=403, detail="הבקשה נדחתה על ידי המנהל")
+def login_token(creds: schemas.LoginRequest, db: Session = Depends(get_db)):
+    # SECURITY: identify by full name, then verify the bcrypt hash
+    user = authenticate(db, creds.full_name, creds.passcode)
 
     # --- 2FA gate (all users) ---
     if user.is_2fa_enabled and user.totp_secret:
@@ -558,15 +651,8 @@ def disable_2fa(current_user: models.User = Depends(get_current_user), db: Sessi
 
 
 @app.post("/users/login", response_model=schemas.UserResponse)
-def login(action: schemas.ShiftAction, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    if not user or not verify_passcode(action.passcode, user, db):
-        raise HTTPException(status_code=401, detail="קוד שגוי")
-    if user.approval_status == "pending":
-        raise HTTPException(status_code=403, detail="החשבון ממתין לאישור המנהל")
-    if user.approval_status == "rejected":
-        raise HTTPException(status_code=403, detail="הבקשה נדחתה על ידי המנהל")
-    return user
+def login(creds: schemas.LoginRequest, db: Session = Depends(get_db)):
+    return authenticate(db, creds.full_name, creds.passcode)
 
 
 # ==========================================
@@ -577,7 +663,7 @@ def generate_join_code():
 
 
 @app.post("/businesses/", response_model=schemas.BusinessResponse)
-def create_business(business: schemas.BusinessCreate, db: Session = Depends(get_db)):
+def create_business(business: schemas.BusinessCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     db_business = models.Business(name=business.name, join_code=generate_join_code())
     db.add(db_business)
     db.commit()
@@ -586,7 +672,8 @@ def create_business(business: schemas.BusinessCreate, db: Session = Depends(get_
 
 
 @app.get("/businesses/{business_id}/join-code")
-def get_join_code(business_id: int, db: Session = Depends(get_db)):
+def get_join_code(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     biz = db.query(models.Business).filter(models.Business.id == business_id).first()
     if not biz:
         raise HTTPException(status_code=404, detail="Business not found")
@@ -597,7 +684,8 @@ def get_join_code(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/businesses/{business_id}/regenerate-code")
-def regenerate_join_code(business_id: int, db: Session = Depends(get_db)):
+def regenerate_join_code(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     biz = db.query(models.Business).filter(models.Business.id == business_id).first()
     if not biz:
         raise HTTPException(status_code=404, detail="Business not found")
@@ -610,15 +698,16 @@ def regenerate_join_code(business_id: int, db: Session = Depends(get_db)):
 # BRANCHES
 # ==========================================
 @app.get("/branches/{business_id}")
-def get_branches(business_id: int, db: Session = Depends(get_db)):
+def get_branches(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     branches = db.query(models.Branch).filter(models.Branch.business_id == business_id).all()
     return [{"id": b.id, "name": b.name, "address": b.address} for b in branches]
 
 
 @app.post("/branches/", response_model=schemas.BranchResponse)
-def create_branch(branch: schemas.BranchCreate, db: Session = Depends(get_db)):
+def create_branch(branch: schemas.BranchCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     db_branch = models.Branch(
-        business_id=branch.business_id,
+        business_id=manager.business_id,
         name=branch.name,
         address=branch.address or ""
     )
@@ -629,10 +718,11 @@ def create_branch(branch: schemas.BranchCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/branches/{branch_id}")
-def update_branch(branch_id: int, data: schemas.BranchCreate, db: Session = Depends(get_db)):
+def update_branch(branch_id: int, data: schemas.BranchCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     branch = db.query(models.Branch).filter(models.Branch.id == branch_id).first()
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
+    check_business(manager, branch.business_id)
     branch.name = data.name
     branch.address = data.address or ""
     db.commit()
@@ -640,10 +730,11 @@ def update_branch(branch_id: int, data: schemas.BranchCreate, db: Session = Depe
 
 
 @app.delete("/branches/{branch_id}")
-def delete_branch(branch_id: int, db: Session = Depends(get_db)):
+def delete_branch(branch_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     branch = db.query(models.Branch).filter(models.Branch.id == branch_id).first()
     if not branch:
         raise HTTPException(status_code=404, detail="Branch not found")
+    check_business(manager, branch.business_id)
     db.delete(branch)
     db.commit()
     return {"status": "deleted"}
@@ -653,13 +744,14 @@ def delete_branch(branch_id: int, db: Session = Depends(get_db)):
 # EMPLOYEES (CRUD)
 # ==========================================
 @app.get("/employees/{business_id}")
-def get_employees(business_id: int, db: Session = Depends(get_db)):
+def get_employees(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     workers = db.query(models.User).filter(models.User.business_id == business_id).all()
+    # SECURITY: passwords are never returned — not even to the manager
     return [{
         "id": w.id,
         "full_name": w.full_name,
         "role": w.role,
-        "passcode": w.passcode,
         "hourly_rate": w.hourly_rate or 0.0,
         "phone": w.phone or "",
         "email": w.email or "",
@@ -669,13 +761,20 @@ def get_employees(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/employees/", response_model=schemas.UserResponse)
-def create_employee(user: schemas.UserCreate, db: Session = Depends(get_db)):
+def create_employee(user: schemas.UserCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    full_name = normalize_name(user.full_name)
+    if not full_name:
+        raise HTTPException(status_code=400, detail="שם מלא חובה")
+    if user.role not in ("worker", "manager"):
+        raise HTTPException(status_code=400, detail="תפקיד לא תקין")
+    validate_passcode(user.passcode)
+    ensure_unique_credentials(db, full_name, user.passcode)
     db_user = models.User(
-        business_id=user.business_id,
-        full_name=user.full_name,
+        business_id=manager.business_id,  # SECURITY: always the manager's own business
+        full_name=full_name,
         role=user.role,
-        passcode=user.passcode,
-        passcode_hash=hash_passcode(user.passcode),  # SECURITY: always hash before storing
+        passcode=None,
+        passcode_hash=hash_passcode(user.passcode),  # SECURITY: store bcrypt hash only
         hourly_rate=user.hourly_rate,
         phone=user.phone,
         email=user.email,
@@ -689,19 +788,37 @@ def create_employee(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/users/", response_model=schemas.UserResponse)
-def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    return create_employee(user, db)
+def create_user(user: schemas.UserCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    return create_employee(user, manager, db)
 
 
-@app.put("/employees/{employee_id}", response_model=schemas.UserResponse)
-def update_employee(employee_id: int, update: schemas.UserUpdate, db: Session = Depends(get_db)):
+def _get_employee_for_manager(employee_id: int, manager: models.User, db: Session) -> models.User:
     user = db.query(models.User).filter(models.User.id == employee_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Employee not found")
+    check_business(manager, user.business_id)
+    return user
+
+
+@app.put("/employees/{employee_id}", response_model=schemas.UserResponse)
+def update_employee(employee_id: int, update: schemas.UserUpdate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    user = _get_employee_for_manager(employee_id, manager, db)
     data = update.dict(exclude_unset=True)
-    # SECURITY: if a new passcode is being set, also update the bcrypt hash
-    if "passcode" in data and data["passcode"]:
-        data["passcode_hash"] = hash_passcode(data["passcode"])
+    new_passcode = data.pop("passcode", None)
+    if "full_name" in data:
+        data["full_name"] = normalize_name(data["full_name"] or "")
+        if not data["full_name"]:
+            raise HTTPException(status_code=400, detail="שם מלא חובה")
+    if "role" in data and data["role"] not in ("worker", "manager"):
+        raise HTTPException(status_code=400, detail="תפקיד לא תקין")
+    if user.id == manager.id and (data.get("role") == "worker" or data.get("is_active") is False):
+        raise HTTPException(status_code=400, detail="לא ניתן להוריד הרשאות או להשבית את עצמך")
+    # SECURITY: a new password is stored as a bcrypt hash only
+    if new_passcode:
+        validate_passcode(new_passcode)
+        ensure_unique_credentials(db, data.get("full_name", user.full_name), new_passcode, exclude_id=user.id)
+        user.passcode_hash = hash_passcode(new_passcode)
+        user.passcode = None
     for field, value in data.items():
         setattr(user, field, value)
     db.commit()
@@ -710,10 +827,10 @@ def update_employee(employee_id: int, update: schemas.UserUpdate, db: Session = 
 
 
 @app.delete("/employees/{employee_id}")
-def deactivate_employee(employee_id: int, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == employee_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Employee not found")
+def deactivate_employee(employee_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    user = _get_employee_for_manager(employee_id, manager, db)
+    if user.id == manager.id:
+        raise HTTPException(status_code=400, detail="לא ניתן להשבית את עצמך")
     user.is_active = False
     db.commit()
     return {"status": "deactivated"}
@@ -722,11 +839,29 @@ def deactivate_employee(employee_id: int, db: Session = Depends(get_db)):
 # ==========================================
 # CLOCK IN / OUT
 # ==========================================
+# שעון משותף (טאבלט בעסק): מזדהים עם שם מלא + סיסמה בכל החתמה.
 @app.post("/shifts/clock-in", response_model=schemas.ShiftResponse)
-def clock_in(action: schemas.ShiftAction, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+def clock_in(creds: schemas.LoginRequest, db: Session = Depends(get_db)):
+    return _do_clock_in(authenticate(db, creds.full_name, creds.passcode), db)
+
+
+@app.post("/shifts/clock-out", response_model=schemas.ShiftResponse)
+def clock_out(creds: schemas.LoginRequest, db: Session = Depends(get_db)):
+    return _do_clock_out(authenticate(db, creds.full_name, creds.passcode), db)
+
+
+# פורטל אישי: העובד כבר מחובר עם טוקן.
+@app.post("/me/clock-in", response_model=schemas.ShiftResponse)
+def my_clock_in(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _do_clock_in(user, db)
+
+
+@app.post("/me/clock-out", response_model=schemas.ShiftResponse)
+def my_clock_out(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _do_clock_out(user, db)
+
+
+def _do_clock_in(user: models.User, db: Session):
     open_shift = db.query(models.Shift).filter(
         models.Shift.user_id == user.id, models.Shift.clock_out == None
     ).first()
@@ -739,11 +874,7 @@ def clock_in(action: schemas.ShiftAction, db: Session = Depends(get_db)):
     return new_shift
 
 
-@app.post("/shifts/clock-out", response_model=schemas.ShiftResponse)
-def clock_out(action: schemas.ShiftAction, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == action.passcode).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+def _do_clock_out(user: models.User, db: Session):
     open_shift = db.query(models.Shift).filter(
         models.Shift.user_id == user.id, models.Shift.clock_out == None
     ).first()
@@ -764,11 +895,8 @@ def clock_out(action: schemas.ShiftAction, db: Session = Depends(get_db)):
     return open_shift
 
 
-@app.get("/shifts/personal/{passcode}")
-def get_personal_shifts(passcode: str, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=404)
+@app.get("/shifts/personal")
+def get_personal_shifts(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     shifts = (
         db.query(models.Shift)
         .filter(models.Shift.user_id == user.id)
@@ -779,11 +907,8 @@ def get_personal_shifts(passcode: str, db: Session = Depends(get_db)):
     return shifts
 
 
-@app.get("/shifts/personal-stats/{passcode}")
-def get_personal_stats(passcode: str, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=404)
+@app.get("/shifts/personal-stats")
+def get_personal_stats(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     now = datetime.now()
     # Fetch individual completed shifts to calculate overtime salary per-shift
     monthly_shifts = (
@@ -843,7 +968,8 @@ def get_personal_stats(passcode: str, db: Session = Depends(get_db)):
 # DASHBOARD (admin)
 # ==========================================
 @app.get("/dashboard/charts/{business_id}")
-def get_dashboard_charts(business_id: int, db: Session = Depends(get_db)):
+def get_dashboard_charts(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     from datetime import timedelta
     now = datetime.now()
     users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
@@ -883,7 +1009,8 @@ def get_dashboard_charts(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/dashboard/stats/{business_id}")
-def get_dashboard_stats(business_id: int, db: Session = Depends(get_db)):
+def get_dashboard_stats(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
     active_count = db.query(models.Shift).filter(
         models.Shift.user_id.in_(users_sub), models.Shift.clock_out == None
@@ -920,7 +1047,8 @@ def get_dashboard_stats(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/dashboard/active-workers/{business_id}")
-def get_active_workers(business_id: int, db: Session = Depends(get_db)):
+def get_active_workers(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
     open_shifts = (
         db.query(models.Shift, models.User)
@@ -940,8 +1068,22 @@ def get_active_workers(business_id: int, db: Session = Depends(get_db)):
     ]
 
 
+def _get_shift_for_manager(shift_id: int, manager: models.User, db: Session) -> models.Shift:
+    row = (
+        db.query(models.Shift, models.User)
+        .join(models.User, models.Shift.user_id == models.User.id)
+        .filter(models.Shift.id == shift_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="משמרת לא נמצאה")
+    check_business(manager, row.User.business_id)
+    return row.Shift
+
+
 @app.post("/shifts/manual-open")
-def manual_open_shift(req: ManualShiftOpen, db: Session = Depends(get_db)):
+def manual_open_shift(req: ManualShiftOpen, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    _get_employee_for_manager(req.user_id, manager, db)
     open_shift = db.query(models.Shift).filter(
         models.Shift.user_id == req.user_id,
         models.Shift.clock_out == None
@@ -957,10 +1099,8 @@ def manual_open_shift(req: ManualShiftOpen, db: Session = Depends(get_db)):
 
 
 @app.post("/shifts/manual-close/{shift_id}")
-def manual_close_shift(shift_id: int, req: ManualShiftClose, db: Session = Depends(get_db)):
-    shift = db.query(models.Shift).filter(models.Shift.id == shift_id).first()
-    if not shift:
-        raise HTTPException(status_code=404, detail="משמרת לא נמצאה")
+def manual_close_shift(shift_id: int, req: ManualShiftClose, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    shift = _get_shift_for_manager(shift_id, manager, db)
     # מנהל יכול לסגור משמרת בכל זמן — עבר או עתיד
     if req.clock_out < to_naive(shift.clock_in):
         raise HTTPException(status_code=400, detail="יציאה לפני כניסה — בדוק תאריכים")
@@ -972,7 +1112,8 @@ def manual_close_shift(shift_id: int, req: ManualShiftClose, db: Session = Depen
 
 
 @app.get("/shifts/status/{business_id}")
-def get_employees_shift_status(business_id: int, db: Session = Depends(get_db)):
+def get_employees_shift_status(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     workers = db.query(models.User).filter(models.User.business_id == business_id).all()
     result = []
     for w in workers:
@@ -993,9 +1134,9 @@ def get_employees_shift_status(business_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/shifts/force-out/{shift_id}")
-def force_clock_out(shift_id: int, db: Session = Depends(get_db)):
-    shift = db.query(models.Shift).filter(models.Shift.id == shift_id).first()
-    if shift and not shift.clock_out:
+def force_clock_out(shift_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    shift = _get_shift_for_manager(shift_id, manager, db)
+    if not shift.clock_out:
         shift.clock_out = now_israel()
         shift.total_hours = round(
             (shift.clock_out - to_naive(shift.clock_in)).total_seconds() / 3600.0, 2
@@ -1005,10 +1146,8 @@ def force_clock_out(shift_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/shifts/edit/{shift_id}")
-def edit_shift(shift_id: int, request: ShiftEditRequest, db: Session = Depends(get_db)):
-    shift = db.query(models.Shift).filter(models.Shift.id == shift_id).first()
-    if not shift:
-        raise HTTPException(status_code=404, detail="Shift not found")
+def edit_shift(shift_id: int, request: ShiftEditRequest, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    shift = _get_shift_for_manager(shift_id, manager, db)
     if request.clock_out < request.clock_in:
         raise HTTPException(status_code=400, detail="זמן יציאה לא יכול להיות לפני זמן כניסה")
     shift.clock_in = request.clock_in
@@ -1020,10 +1159,8 @@ def edit_shift(shift_id: int, request: ShiftEditRequest, db: Session = Depends(g
 
 
 @app.delete("/shifts/{shift_id}")
-def delete_shift(shift_id: int, db: Session = Depends(get_db)):
-    shift = db.query(models.Shift).filter(models.Shift.id == shift_id).first()
-    if not shift:
-        raise HTTPException(status_code=404, detail="Shift not found")
+def delete_shift(shift_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    shift = _get_shift_for_manager(shift_id, manager, db)
     db.delete(shift)
     db.commit()
     return {"ok": True}
@@ -1035,8 +1172,10 @@ def get_all_shifts(
     worker_id: Optional[int] = None,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     users_sub = db.query(models.User.id).filter(models.User.business_id == business_id).subquery()
     query = db.query(models.Shift, models.User).join(models.User).filter(
         models.Shift.user_id.in_(users_sub)
@@ -1066,8 +1205,10 @@ def get_employee_summary(
     business_id: int,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     workers = db.query(models.User).filter(models.User.business_id == business_id).all()
     result = []
     for w in workers:
@@ -1091,7 +1232,8 @@ def get_employee_summary(
 
 
 @app.get("/dashboard/workers/{business_id}")
-def get_business_workers(business_id: int, db: Session = Depends(get_db)):
+def get_business_workers(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     workers = db.query(models.User).filter(models.User.business_id == business_id).all()
     return [{"id": w.id, "full_name": w.full_name} for w in workers]
 
@@ -1105,8 +1247,10 @@ def get_schedule(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     user_id: Optional[int] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     query = (
         db.query(models.ScheduledShift, models.User)
         .join(models.User)
@@ -1133,10 +1277,11 @@ def get_schedule(
 
 
 @app.post("/schedule/", response_model=schemas.ScheduledShiftResponse)
-def create_scheduled_shift(shift: schemas.ScheduledShiftCreate, db: Session = Depends(get_db)):
+def create_scheduled_shift(shift: schemas.ScheduledShiftCreate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    _get_employee_for_manager(shift.user_id, manager, db)
     db_shift = models.ScheduledShift(
         user_id=shift.user_id,
-        business_id=shift.business_id,
+        business_id=manager.business_id,
         start_time=shift.start_time,
         end_time=shift.end_time,
         notes=shift.notes or "",
@@ -1148,10 +1293,11 @@ def create_scheduled_shift(shift: schemas.ScheduledShiftCreate, db: Session = De
 
 
 @app.delete("/schedule/{schedule_id}")
-def delete_scheduled_shift(schedule_id: int, db: Session = Depends(get_db)):
+def delete_scheduled_shift(schedule_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     shift = db.query(models.ScheduledShift).filter(models.ScheduledShift.id == schedule_id).first()
     if not shift:
         raise HTTPException(status_code=404, detail="Not found")
+    check_business(manager, shift.business_id)
     db.delete(shift)
     db.commit()
     return {"status": "deleted"}
@@ -1161,10 +1307,9 @@ def delete_scheduled_shift(schedule_id: int, db: Session = Depends(get_db)):
 # LEAVE REQUESTS
 # ==========================================
 @app.post("/leave/", response_model=schemas.LeaveRequestResponse)
-def create_leave_request(request: schemas.LeaveRequestCreate, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == request.passcode).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+def create_leave_request(request: schemas.LeaveRequestCreate, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if request.end_date < request.start_date:
+        raise HTTPException(status_code=400, detail="תאריך הסיום לפני תאריך ההתחלה")
     db_leave = models.LeaveRequest(
         user_id=user.id,
         business_id=user.business_id,
@@ -1184,11 +1329,8 @@ def create_leave_request(request: schemas.LeaveRequestCreate, db: Session = Depe
     return db_leave
 
 
-@app.get("/leave/personal/{passcode}")
-def get_personal_leave(passcode: str, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=404)
+@app.get("/leave/personal")
+def get_personal_leave(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     requests = (
         db.query(models.LeaveRequest)
         .filter(models.LeaveRequest.user_id == user.id)
@@ -1202,8 +1344,10 @@ def get_personal_leave(passcode: str, db: Session = Depends(get_db)):
 def get_leave_requests(
     business_id: int,
     status: Optional[str] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     query = (
         db.query(models.LeaveRequest, models.User)
         .join(models.User)
@@ -1230,10 +1374,13 @@ def get_leave_requests(
 
 
 @app.put("/leave/{leave_id}/status")
-def update_leave_status(leave_id: int, update: schemas.LeaveStatusUpdate, db: Session = Depends(get_db)):
+def update_leave_status(leave_id: int, update: schemas.LeaveStatusUpdate, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     leave = db.query(models.LeaveRequest).filter(models.LeaveRequest.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave request not found")
+    check_business(manager, leave.business_id)
+    if update.status not in ("approved", "rejected", "pending"):
+        raise HTTPException(status_code=400, detail="סטטוס לא תקין")
     leave.status = update.status
     leave.manager_note = update.manager_note or ""
     db.commit()
@@ -1255,8 +1402,12 @@ def update_leave_status(leave_id: int, update: schemas.LeaveStatusUpdate, db: Se
 def get_notifications(
     business_id: int,
     user_id: Optional[int] = None,
+    current: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    check_business(current, business_id)
+    if current.role != "manager":
+        user_id = current.id  # עובד רואה רק את ההתראות שלו
     query = db.query(models.Notification).filter(
         models.Notification.business_id == business_id,
         models.Notification.is_read == False,
@@ -1270,16 +1421,20 @@ def get_notifications(
 
 
 @app.post("/notifications/mark-read/{notif_id}")
-def mark_notification_read(notif_id: int, db: Session = Depends(get_db)):
+def mark_notification_read(notif_id: int, current: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     notif = db.query(models.Notification).filter(models.Notification.id == notif_id).first()
-    if notif:
+    allowed = notif and notif.business_id == current.business_id and (
+        current.role == "manager" or notif.user_id == current.id
+    )
+    if allowed:
         notif.is_read = True
         db.commit()
     return {"status": "ok"}
 
 
 @app.post("/notifications/mark-all-read/{business_id}")
-def mark_all_read(business_id: int, db: Session = Depends(get_db)):
+def mark_all_read(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     db.query(models.Notification).filter(
         models.Notification.business_id == business_id,
         models.Notification.is_read == False,
@@ -1297,8 +1452,10 @@ def get_monthly_report(
     business_id: int,
     year: Optional[int] = None,
     month: Optional[int] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     now = datetime.now()
     year = year or now.year
     month = month or now.month
@@ -1346,8 +1503,10 @@ def export_monthly_csv(
     business_id: int,
     year: Optional[int] = None,
     month: Optional[int] = None,
+    manager: models.User = Depends(require_manager),
     db: Session = Depends(get_db),
 ):
+    check_business(manager, business_id)
     now = datetime.now()
     year = year or now.year
     month = month or now.month
@@ -1427,14 +1586,11 @@ def ai_execute_action(req: AIActionRequest, manager: dict = Depends(get_manager_
 
 
 @app.post("/ai/employee-ask")
-def employee_ai_ask(payload: dict, db: Session = Depends(get_db)):
-    passcode = payload.get("passcode")
-    query = payload.get("query")
+def employee_ai_ask(payload: dict, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = (payload.get("query") or "").strip()
     history = payload.get("history", [])
-
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
 
     # משמרות אחרונות של העובד
     shifts = db.query(models.Shift).filter(models.Shift.user_id == user.id).order_by(models.Shift.clock_in.desc()).limit(20).all()
@@ -1502,12 +1658,9 @@ SHIFT_TIMES = {
 DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 
 
-@app.get("/roster/my-week/{passcode}")
-def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db)):
+@app.get("/roster/my-week")
+def get_my_roster(week_start: str, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     from datetime import date as date_type
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
     week = date_type.fromisoformat(week_start)
     entries = db.query(models.ShiftRoster).filter(
         models.ShiftRoster.user_id == user.id,
@@ -1537,20 +1690,17 @@ def get_my_roster(passcode: str, week_start: str, db: Session = Depends(get_db))
 
 
 @app.post("/roster/preference")
-def submit_preference(payload: dict, db: Session = Depends(get_db)):
+def submit_preference(payload: dict, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     """עובד מגיש העדפת משמרת ליום שלא סוידר"""
     from datetime import date as date_type
-    passcode = payload.get("passcode")
     week_start = payload.get("week_start")
     day = payload.get("day")
     preference = payload.get("preference")
 
     if preference not in ("morning", "evening", "double"):
         raise HTTPException(status_code=400, detail="העדפה לא תקינה")
-
-    user = db.query(models.User).filter(models.User.passcode == passcode).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="משתמש לא נמצא")
+    if day not in range(7):
+        raise HTTPException(status_code=400, detail="יום לא תקין")
 
     week = date_type.fromisoformat(week_start)
 
@@ -1568,8 +1718,9 @@ def submit_preference(payload: dict, db: Session = Depends(get_db)):
 
 
 @app.get("/roster/preferences/{business_id}")
-def get_preferences(business_id: int, week_start: str, db: Session = Depends(get_db)):
+def get_preferences(business_id: int, week_start: str, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     """מנהל רואה את כל ההעדפות של העובדים לשבוע"""
+    check_business(manager, business_id)
     from datetime import date as date_type
     week = date_type.fromisoformat(week_start)
     prefs = db.query(models.ShiftPreference, models.User).join(
@@ -1586,7 +1737,9 @@ def get_preferences(business_id: int, week_start: str, db: Session = Depends(get
 
 
 @app.get("/roster/{business_id}")
-def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db)):
+def get_roster(business_id: int, week_start: str, current: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # גם עובדים רואים את הסידור (תצוגת "מי עובד איתי") — אבל רק של העסק שלהם
+    check_business(current, business_id)
     from datetime import date as date_type
     week = date_type.fromisoformat(week_start)
     employees = db.query(models.User).filter(
@@ -1617,10 +1770,14 @@ def get_roster(business_id: int, week_start: str, db: Session = Depends(get_db))
 
 
 @app.post("/roster/{business_id}")
-def save_roster(business_id: int, payload: dict, db: Session = Depends(get_db)):
+def save_roster(business_id: int, payload: dict, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
     from datetime import date as date_type
     week = date_type.fromisoformat(payload["week_start"])
     entries = payload.get("entries", [])
+    own_ids = {u.id for u in db.query(models.User.id).filter(models.User.business_id == business_id).all()}
+    if any(e.get("user_id") not in own_ids for e in entries):
+        raise HTTPException(status_code=403, detail="ניסיון לשבץ עובד שאינו שייך לעסק")
     db.query(models.ShiftRoster).filter(
         models.ShiftRoster.business_id == business_id,
         models.ShiftRoster.week_start == week
