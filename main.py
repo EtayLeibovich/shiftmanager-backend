@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract, text
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 from pydantic import BaseModel
 import models
@@ -145,6 +145,41 @@ def _users_by_name(db: Session, full_name: str):
         func.lower(func.trim(models.User.full_name)) == _name_key(full_name)
     ).all()
 
+
+
+# ---------------------------------------------------------------------------
+# Roster weeks start on Sunday. Older clients computed the week start with
+# toISOString() (UTC), which in Israel turned Sunday 00:00 into Saturday.
+# ---------------------------------------------------------------------------
+def normalize_week_start(d: date) -> date:
+    """Saturday -> the following Sunday (legacy UTC bug); any other day -> Sunday of its week."""
+    if d.weekday() == 5:  # Saturday
+        return d + timedelta(days=1)
+    return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
+def parse_week_start(value: str) -> date:
+    try:
+        return normalize_week_start(date.fromisoformat(str(value)[:10]))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="תאריך שבוע לא תקין")
+
+
+def migrate_saturday_weeks(db: Session):
+    """One-off fix for rows saved under a Saturday week_start. Idempotent."""
+    for model, key in ((models.ShiftRoster, ("business_id", "user_id", "day_of_week")),
+                       (models.ShiftPreference, ("business_id", "user_id", "day_of_week"))):
+        rows = db.query(model).all()
+        existing = {(r.week_start,) + tuple(getattr(r, k) for k in key) for r in rows}
+        for r in rows:
+            if r.week_start and r.week_start.weekday() == 5:
+                target = r.week_start + timedelta(days=1)
+                if (target,) + tuple(getattr(r, k) for k in key) in existing:
+                    db.delete(r)  # a Sunday-dated row already covers this slot
+                else:
+                    r.week_start = target
+                    existing.add((target,) + tuple(getattr(r, k) for k in key))
+    db.commit()
 
 def validate_passcode(passcode: str):
     if not passcode or len(passcode) < MIN_PASSCODE_LEN:
@@ -321,6 +356,7 @@ def auto_seed():
             if u.full_name and u.full_name != normalize_name(u.full_name):
                 u.full_name = normalize_name(u.full_name)
         db.commit()
+        migrate_saturday_weeks(db)
     finally:
         db.close()
 
@@ -1707,7 +1743,7 @@ DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "
 @app.get("/roster/my-week")
 def get_my_roster(week_start: str, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     from datetime import date as date_type
-    week = date_type.fromisoformat(week_start)
+    week = parse_week_start(week_start)
     entries = db.query(models.ShiftRoster).filter(
         models.ShiftRoster.user_id == user.id,
         models.ShiftRoster.week_start == week
@@ -1748,7 +1784,7 @@ def submit_preference(payload: dict, user: models.User = Depends(get_current_use
     if day not in range(7):
         raise HTTPException(status_code=400, detail="יום לא תקין")
 
-    week = date_type.fromisoformat(week_start)
+    week = parse_week_start(week_start)
 
     db.query(models.ShiftPreference).filter(
         models.ShiftPreference.user_id == user.id,
@@ -1768,7 +1804,7 @@ def get_preferences(business_id: int, week_start: str, manager: models.User = De
     """מנהל רואה את כל ההעדפות של העובדים לשבוע"""
     check_business(manager, business_id)
     from datetime import date as date_type
-    week = date_type.fromisoformat(week_start)
+    week = parse_week_start(week_start)
     prefs = db.query(models.ShiftPreference, models.User).join(
         models.User, models.ShiftPreference.user_id == models.User.id
     ).filter(
@@ -1787,7 +1823,7 @@ def get_roster(business_id: int, week_start: str, current: models.User = Depends
     # גם עובדים רואים את הסידור (תצוגת "מי עובד איתי") — אבל רק של העסק שלהם
     check_business(current, business_id)
     from datetime import date as date_type
-    week = date_type.fromisoformat(week_start)
+    week = parse_week_start(week_start)
     employees = db.query(models.User).filter(
         models.User.business_id == business_id,
         models.User.role != "manager",
@@ -1819,7 +1855,7 @@ def get_roster(business_id: int, week_start: str, current: models.User = Depends
 def save_roster(business_id: int, payload: dict, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     check_business(manager, business_id)
     from datetime import date as date_type
-    week = date_type.fromisoformat(payload["week_start"])
+    week = parse_week_start(payload["week_start"])
     entries = payload.get("entries", [])
     own_ids = {u.id for u in db.query(models.User.id).filter(models.User.business_id == business_id).all()}
     if any(e.get("user_id") not in own_ids for e in entries):

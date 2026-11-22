@@ -1,0 +1,16 @@
+# Keeps the free Render instance awake so users don't wait ~50s for a cold start.
+# Render's free tier includes 750 instance-hours/month — enough for one service 24/7.
+name: keep-alive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay scheduled runs slightly)
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /health
+        run: curl -fsS --max-time 90 https://shiftmanager-backend-n0ix.onrender.com/health
