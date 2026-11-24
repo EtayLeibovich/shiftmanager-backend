@@ -12,6 +12,7 @@ import schemas
 import auth
 import ai_agent
 import agents
+import swaps
 import demo
 from database import engine, get_db
 from groq import Groq
@@ -2059,3 +2060,85 @@ def agent_assign_shift(business_id: int, req: AssignShiftRequest, manager: model
         create_notification(db, business_id, "manager_message",
                             f"שובצת למשמרת {label} ביום {agents.DAY_NAMES[agents.day_index(d)]} {d:%d/%m}", user_id=emp.id)
     return {"ok": True, "warnings": [i["message"] for i in new_issues if i["severity"] != "info"]}
+
+
+# ==========================================
+# SHIFT SWAPS — "מי לוקח?" בקשת מחליף לכל העובדים, באישור מנהל
+# ==========================================
+class SwapRequestBody(BaseModel):
+    date: str
+    note: Optional[str] = None
+
+
+class SwapPostBody(BaseModel):
+    date: str
+    shift_type: str
+    note: Optional[str] = None
+    replaces_employee_id: Optional[int] = None
+
+
+class SwapApproveBody(BaseModel):
+    user_id: int
+
+
+def _swap_call(fn, *args):
+    try:
+        return fn(*args)
+    except swaps.SwapError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+
+@app.post("/swaps/request")
+def swap_request(body: SwapRequestBody, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    s = _swap_call(swaps.request_swap, db, user, _parse_day(body.date), body.note or "", now_israel())
+    db.commit()
+    return {"ok": True, "id": s.id}
+
+
+@app.get("/swaps/open")
+def swap_open(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return swaps.open_swaps_for_worker(db, user, now_israel())
+
+
+@app.post("/swaps/{swap_id}/volunteer")
+def swap_volunteer(swap_id: int, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _swap_call(swaps.volunteer, db, user, swap_id, now_israel())
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/swaps/{swap_id}/volunteer")
+def swap_withdraw(swap_id: int, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _swap_call(swaps.withdraw, db, user, swap_id)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/swaps/{swap_id}/cancel")
+def swap_cancel(swap_id: int, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _swap_call(swaps.cancel, db, user, swap_id, now_israel())
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/swaps/manage/{business_id}")
+def swap_list_manager(business_id: int, include_closed: bool = False, manager: models.User = Depends(require_manager),
+                      db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    return swaps.list_for_manager(db, business_id, now_israel(), include_closed)
+
+
+@app.post("/swaps/post/{business_id}")
+def swap_post(business_id: int, body: SwapPostBody, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    s = _swap_call(swaps.post_open_shift, db, manager, _parse_day(body.date), body.shift_type, body.note or "",
+                   body.replaces_employee_id, now_israel())
+    db.commit()
+    return {"ok": True, "id": s.id}
+
+
+@app.post("/swaps/{swap_id}/approve")
+def swap_approve(swap_id: int, body: SwapApproveBody, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    res = _swap_call(swaps.approve, db, manager, swap_id, body.user_id, now_israel())
+    db.commit()
+    return res

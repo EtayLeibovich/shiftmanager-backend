@@ -59,6 +59,10 @@ def ensure_demo(db, hash_passcode, now: datetime) -> models.Business:
 def _wipe(db, biz):
     bid = biz.id
     user_ids = [u.id for u in db.query(models.User.id).filter(models.User.business_id == bid).all()]
+    vol_swaps = [s.id for s in db.query(models.ShiftSwap.id).filter(models.ShiftSwap.business_id == bid).all()]
+    if vol_swaps:
+        db.query(models.SwapVolunteer).filter(models.SwapVolunteer.swap_id.in_(vol_swaps)).delete(synchronize_session=False)
+    db.query(models.ShiftSwap).filter(models.ShiftSwap.business_id == bid).delete(synchronize_session=False)
     for model in (models.Notification, models.LeaveRequest, models.ShiftPreference,
                   models.ShiftRoster, models.ScheduledShift, models.AuditLog):
         db.query(model).filter(model.business_id == bid).delete(synchronize_session=False)
@@ -239,6 +243,39 @@ def _rebuild(db, biz, hash_passcode, now: datetime) -> models.Business:
                                          is_read=False))
     db.add_all(notes)
     db.flush()
+
+    # ---- shift swaps ("מי לוקח?") ----
+    def rostered(w, d):
+        return any(r.user_id == w.id and r.week_start + timedelta(days=r.day_of_week) == d for r in roster)
+
+    def roster_of(w, d):
+        return next((r for r in roster if r.user_id == w.id and r.week_start + timedelta(days=r.day_of_week) == d), None)
+
+    made = 0
+    for ahead in range(1, 6):
+        d = today + timedelta(days=ahead)
+        if d >= next_week + timedelta(days=3):
+            break
+        for w in workers[1:]:
+            r = roster_of(w, d)
+            if not r or made >= 2:
+                continue
+            if made == 0:
+                vol = next((x for x in workers[1:] if x is not w and not rostered(x, d) and x is not workers[3]), None)
+                if vol is None:
+                    continue
+                sw = models.ShiftSwap(business_id=biz.id, requester_id=w.id, date=d, shift_type=r.shift_type,
+                                      note="יש לי מבחן למחרת", status="open", created_at=now - timedelta(hours=5))
+                db.add(sw); db.flush()
+                db.add(models.SwapVolunteer(swap_id=sw.id, user_id=vol.id, status="pending", created_at=now - timedelta(hours=2)))
+                made += 1
+            elif not rostered(noa, d):
+                sw = models.ShiftSwap(business_id=biz.id, requester_id=w.id, date=d, shift_type=r.shift_type,
+                                      note="אירוע משפחתי", status="open", created_at=now - timedelta(hours=1))
+                db.add(sw); db.flush()
+                db.add(models.Notification(business_id=biz.id, user_id=noa.id, type="open_shift", is_read=False,
+                                           message=f"🔄 {w.full_name} מחפש/ת מחליף למשמרת ביום {d:%d/%m}. אפשר לקחת אותה בפורטל"))
+                made += 1
 
     # ---- change log: a few realistic entries so the log isn't empty ----
     db.add(manager)

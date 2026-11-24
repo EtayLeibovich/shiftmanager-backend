@@ -214,6 +214,11 @@ def audit_payroll(db, business_id, year=None, month=None):
     return res
 
 
+def list_shift_swaps(db, business_id):
+    import swaps
+    return swaps.list_for_manager(db, business_id, _now())
+
+
 def get_change_log(db, business_id, limit=20):
     rows = agents.list_audit(db, business_id, min(int(limit or 20), 50))
     return [{k: r[k] for k in ("created_at", "actor", "summary", "source")} for r in rows]
@@ -329,6 +334,7 @@ TOOL_DEFS = [
         {"year": {"type": "integer"}, "month": {"type": "integer"}}),
     _fn("get_change_log", "יומן השינויים: מי שינה מה ומתי (שעות, סידור, חופשות, עובדים).",
         {"limit": {"type": "integer", "description": "כמה רשומות אחרונות (עד 50)"}}),
+    _fn("list_shift_swaps", "בקשות החלפה פתוחות: מי ביקש מחליף, לאיזו משמרת, ומי מהעובדים התנדב לקחת אותה (כולל אזהרות חוק)."),
     _fn("set_roster_shift", "שבץ עובד למשמרת בסידור ביום מסוים (דורש אישור מנהל). off = הסר שיבוץ.",
         {"employee_id": {"type": "integer"},
          "date": {"type": "string", "description": "YYYY-MM-DD"},
@@ -357,6 +363,7 @@ READ_TOOLS = {
     "find_replacements": find_replacements,
     "audit_payroll": audit_payroll,
     "get_change_log": get_change_log,
+    "list_shift_swaps": list_shift_swaps,
 }
 
 WRITE_TOOLS = {

@@ -152,6 +152,32 @@ class Notification(Base):
     user = relationship("User", back_populates="notifications")
 
 
+class ShiftSwap(Base):
+    """בקשת מחליף: עובד (או המנהל) מפרסם משמרת, עובדים מתנדבים, המנהל מאשר אחד."""
+    __tablename__ = "shift_swaps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id"), index=True)
+    requester_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # None = פורסם ע"י המנהל
+    date = Column(Date)
+    shift_type = Column(String)            # morning | evening | double
+    note = Column(Text, nullable=True)
+    status = Column(String, default="open")  # open | filled | cancelled
+    filled_by = Column(Integer, nullable=True)
+    created_at = Column(DateTime)
+    resolved_at = Column(DateTime, nullable=True)
+
+
+class SwapVolunteer(Base):
+    __tablename__ = "swap_volunteers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    swap_id = Column(Integer, ForeignKey("shift_swaps.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    status = Column(String, default="pending")  # pending | approved | declined
+    created_at = Column(DateTime)
+
+
 class AuditLog(Base):
     """יומן שינויים — כל רשומה נושאת hash של הקודמת, כך ששינוי מחוץ למערכת מתגלה."""
     __tablename__ = "audit_log"

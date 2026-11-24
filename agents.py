@@ -455,6 +455,17 @@ def daily_briefing(db: Session, business_id: int, now: datetime) -> dict:
         items.append({"severity": "medium", "code": "pending_leave",
                       "title": f"{pending_leave} בקשות חופש ממתינות לאישורך", "detail": "",
                       "action": {"type": "tab", "tab": "leave"}})
+    import swaps  # local import: swaps imports agents
+    open_swaps, swaps_waiting = swaps.pending_count(db, business_id, today)
+    if swaps_waiting:
+        items.append({"severity": "high", "code": "swap_waiting",
+                      "title": f"{swaps_waiting} בקשות החלפה עם מתנדבים מחכות לאישורך",
+                      "detail": "עובדים סימנו שהם לוקחים משמרת. אחרי האישור הסידור מתעדכן וכולם מקבלים הודעה",
+                      "action": {"type": "tab", "tab": "swaps"}})
+    elif open_swaps:
+        items.append({"severity": "info", "code": "swap_open",
+                      "title": f"{open_swaps} משמרות מחפשות מחליף", "detail": "עוד אף עובד לא התנדב",
+                      "action": {"type": "tab", "tab": "swaps"}})
     pending_regs = sum(1 for u in users.values() if u.approval_status == "pending")
     if pending_regs:
         items.append({"severity": "medium", "code": "pending_registration",
@@ -515,7 +526,8 @@ def daily_briefing(db: Session, business_id: int, now: datetime) -> dict:
         "headline": headline,
         "stats": {"rostered_today": len(rostered_today), "morning": counts["morning"] + counts["double"],
                   "evening": counts["evening"] + counts["double"], "on_shift_now": len(open_shifts),
-                  "pending_leave": pending_leave, "pending_registrations": pending_regs},
+                  "pending_leave": pending_leave, "pending_registrations": pending_regs,
+                  "open_swaps": open_swaps},
         "items": items,
     }
 
