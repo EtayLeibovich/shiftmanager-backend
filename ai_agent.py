@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import extract
 from sqlalchemy.orm import Session
 
+import agents
 import models
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -183,6 +184,41 @@ def get_hours_report(db, business_id, year=None, month=None, calc_salary=None):
     return {"year": year, "month": month, "employees": rows}
 
 
+def _now() -> datetime:
+    return datetime.now(ISRAEL_TZ).replace(tzinfo=None)
+
+
+def check_roster_compliance(db, business_id, week_start=None):
+    d = _parse_date(week_start) if week_start else _today()
+    res = agents.check_week(db, business_id, d)
+    res["issues"] = res["issues"][:25]
+    return res
+
+
+def get_daily_briefing(db, business_id):
+    return agents.daily_briefing(db, business_id, _now())
+
+
+def find_replacements(db, business_id, date=None, shift_type="morning", exclude_employee_id=None):
+    d = _parse_date(date) if date else _today()
+    if shift_type not in agents.SHIFT_WINDOWS:
+        raise ToolError("shift_type חייב להיות morning, evening או double")
+    return agents.suggest_replacements(db, business_id, d, shift_type,
+                                       int(exclude_employee_id) if exclude_employee_id else None)
+
+
+def audit_payroll(db, business_id, year=None, month=None):
+    today = _today()
+    res = agents.payroll_audit(db, business_id, int(year or today.year), int(month or today.month), _now())
+    res["issues"] = res["issues"][:30]
+    return res
+
+
+def get_change_log(db, business_id, limit=20):
+    rows = agents.list_audit(db, business_id, min(int(limit or 20), 50))
+    return [{k: r[k] for k in ("created_at", "actor", "summary", "source")} for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # כלי כתיבה — validate_* בונה תיאור לאישור, _exec_* מבצע בפועל
 # ---------------------------------------------------------------------------
@@ -194,7 +230,12 @@ def _validate_set_roster_shift(db, business_id, args):
         raise ToolError("shift_type חייב להיות אחד מ: morning, evening, double, off")
     _, day_idx = _week_start_and_day(d)
     pos = f" ({args['position']})" if args.get("position") else ""
-    return f"שיבוץ {emp.full_name} ביום {DAY_NAMES[day_idx]} {d.strftime('%d/%m')}: {SHIFT_NAMES[shift_type]}{pos}"
+    desc = f"שיבוץ {emp.full_name} ביום {DAY_NAMES[day_idx]} {d.strftime('%d/%m')}: {SHIFT_NAMES[shift_type]}{pos}"
+    # שומר החוק: מצרף לתיאור כל בעיה חדשה שהשיבוץ ייצור, כדי שהמנהל יראה אותה לפני האישור
+    new_issues = [i for i in agents.check_hypothetical(db, business_id, emp.id, d, shift_type) if i["severity"] != "info"]
+    if new_issues:
+        desc += " ⚠️ " + " | ".join(i["message"] for i in new_issues[:2])
+    return desc
 
 
 def _exec_set_roster_shift(db, business_id, args):
@@ -275,6 +316,19 @@ TOOL_DEFS = [
     _fn("get_active_workers", "מי נמצא כרגע במשמרת (החתים כניסה ולא יציאה)."),
     _fn("get_hours_report", "דוח שעות ושכר משוער לחודש.",
         {"year": {"type": "integer"}, "month": {"type": "integer"}}),
+    _fn("check_roster_compliance", "שומר החוק: בודק את הסידור של שבוע מול חוקי העבודה (מנוחה שבועית 36 שעות, נוער, "
+        "שעות ביום ובשבוע, התנגשות עם חופשות). השתמש בו לפני ואחרי שיבוצים.",
+        {"week_start": {"type": "string", "description": "כל תאריך בשבוע, YYYY-MM-DD. ברירת מחדל: השבוע הנוכחי"}}),
+    _fn("get_daily_briefing", "תדריך בוקר: מי לא הגיע, מי שכח להחתים יציאה, בקשות ממתינות, בעיות בסידור ושעות נוספות צפויות."),
+    _fn("find_replacements", "מוצא מחליף: מדרג עובדים שיכולים לקחת משמרת ביום מסוים, לפי העדפות, שעות השבוע וחוקי העבודה.",
+        {"date": {"type": "string", "description": "YYYY-MM-DD"},
+         "shift_type": {"type": "string", "enum": ["morning", "evening", "double"]},
+         "exclude_employee_id": {"type": "integer", "description": "העובד שצריך להחליף (אופציונלי)"}},
+        ["date", "shift_type"]),
+    _fn("audit_payroll", "מבקר טרום-שכר: מוצא טעויות בנוכחות ובשכר של חודש (משמרות פתוחות, חפיפות, שבת, שכר מינימום, שובץ ולא הגיע).",
+        {"year": {"type": "integer"}, "month": {"type": "integer"}}),
+    _fn("get_change_log", "יומן השינויים: מי שינה מה ומתי (שעות, סידור, חופשות, עובדים).",
+        {"limit": {"type": "integer", "description": "כמה רשומות אחרונות (עד 50)"}}),
     _fn("set_roster_shift", "שבץ עובד למשמרת בסידור ביום מסוים (דורש אישור מנהל). off = הסר שיבוץ.",
         {"employee_id": {"type": "integer"},
          "date": {"type": "string", "description": "YYYY-MM-DD"},
@@ -298,6 +352,11 @@ READ_TOOLS = {
     "list_leave_requests": list_leave_requests,
     "get_active_workers": get_active_workers,
     "get_hours_report": get_hours_report,
+    "check_roster_compliance": check_roster_compliance,
+    "get_daily_briefing": get_daily_briefing,
+    "find_replacements": find_replacements,
+    "audit_payroll": audit_payroll,
+    "get_change_log": get_change_log,
 }
 
 WRITE_TOOLS = {
@@ -317,7 +376,12 @@ def run_agent(client, db: Session, business_id: int, query: str, history: list, 
         f"היום: יום {DAY_NAMES[_week_start_and_day(today)[1]]}, {today.isoformat()}. השבוע מתחיל ביום ראשון.\n"
         "השתמש בכלים כדי לשלוף נתונים — אל תמציא נתונים. כדי לשבץ/לאשר/לשלוח הודעה, "
         "קודם מצא את ה-id המתאים (list_employees / list_leave_requests) ואז קרא לכלי הכתיבה. "
-        "פעולות כתיבה לא מבוצעות מיד — הן ממתינות לאישור המנהל, אז אמור לו לאשר אותן בכפתורים."
+        "פעולות כתיבה לא מבוצעות מיד — הן ממתינות לאישור המנהל, אז אמור לו לאשר אותן בכפתורים.\n"
+        "יש לך סוכנים מומחים ככלים: check_roster_compliance (חוקי עבודה בסידור), get_daily_briefing (תדריך), "
+        "find_replacements (מחליף), audit_payroll (בדיקת שכר), get_change_log (יומן שינויים). "
+        "כשמבקשים מחליף: קרא ל-find_replacements, הצע את המועמד הראשון שמסומן ok, ואז הצע set_roster_shift "
+        "ו-notify_employee. אל תציע שיבוץ שיוצר בעיה חוקית בלי לציין אותה במפורש. "
+        "הבדיקות החוקיות הן עזר ולא ייעוץ משפטי."
     )
     messages = [{"role": "system", "content": system}]
     for m in history[-20:]:

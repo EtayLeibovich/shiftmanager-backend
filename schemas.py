@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 # ==========================================
@@ -49,6 +49,14 @@ class UserCreate(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     branch_id: Optional[int] = None
+    birth_date: Optional[date] = None
+
+    @field_validator("birth_date")
+    @classmethod
+    def _valid_birth(cls, v):
+        if v and not (date(1900, 1, 1) <= v <= date.today()):
+            raise ValueError("תאריך לידה לא תקין")
+        return v
 
 
 class UserUpdate(BaseModel):
@@ -60,6 +68,14 @@ class UserUpdate(BaseModel):
     email: Optional[str] = None
     branch_id: Optional[int] = None
     is_active: Optional[bool] = None
+    birth_date: Optional[date] = None
+
+    @field_validator("birth_date")
+    @classmethod
+    def _valid_birth(cls, v):
+        if v and not (date(1900, 1, 1) <= v <= date.today()):
+            raise ValueError("תאריך לידה לא תקין")
+        return v
 
 
 class UserResponse(BaseModel):
@@ -72,6 +88,7 @@ class UserResponse(BaseModel):
     email: Optional[str] = None
     branch_id: Optional[int] = None
     is_active: Optional[bool] = True
+    birth_date: Optional[date] = None
 
     class Config:
         from_attributes = True

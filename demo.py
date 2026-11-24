@@ -12,6 +12,7 @@ import secrets
 import threading
 from datetime import datetime, timedelta, date, time
 
+import agents
 import models
 
 DEMO_JOIN_CODE = "DEMO00"
@@ -20,17 +21,18 @@ DEMO_MANAGER_NAME = "מיכל אברהם"
 DEMO_EMPLOYEE_NAME = "נועה לוי"
 RESET_HOURS = 6
 
-# name, hourly rate, branch index, default position, usual shift
+# name, hourly rate, branch index, default position, usual shift, age
+# שירה בת 16 ומשובצת לערבים — כדי ששומר החוק יראה בדמו התראת עבודת נוער בלילה.
 WORKERS = [
-    ("נועה לוי", 45, 0, "קופה", "morning"),
-    ("דניאל כהן", 42, 0, "בר", "evening"),
-    ("יוסי מזרחי", 40, 1, "מטבח", "morning"),
-    ("שירה פרץ", 38, 0, "מלצרות", "evening"),
-    ("עומר ביטון", 50, 0, "מטבח", "morning"),
-    ("מאיה גולן", 36, 1, "מלצרות", "evening"),
-    ("איתן שפירא", 40, 1, "בר", "evening"),
-    ("רוני אזולאי", 37, 0, "מלצרות", "morning"),
-    ("תמר רוזן", 44, 1, "קופה", "morning"),
+    ("נועה לוי", 45, 0, "קופה", "morning", 24),
+    ("דניאל כהן", 42, 0, "בר", "evening", 27),
+    ("יוסי מזרחי", 40, 1, "מטבח", "morning", 31),
+    ("שירה פרץ", 33, 0, "מלצרות", "evening", 16),
+    ("עומר ביטון", 50, 0, "מטבח", "morning", 35),
+    ("מאיה גולן", 36, 1, "מלצרות", "evening", 19),
+    ("איתן שפירא", 40, 1, "בר", "evening", 22),
+    ("רוני אזולאי", 41, 0, "מלצרות", "morning", 21),
+    ("תמר רוזן", 44, 1, "קופה", "morning", 29),
 ]
 
 _lock = threading.Lock()
@@ -58,7 +60,7 @@ def _wipe(db, biz):
     bid = biz.id
     user_ids = [u.id for u in db.query(models.User.id).filter(models.User.business_id == bid).all()]
     for model in (models.Notification, models.LeaveRequest, models.ShiftPreference,
-                  models.ShiftRoster, models.ScheduledShift):
+                  models.ShiftRoster, models.ScheduledShift, models.AuditLog):
         db.query(model).filter(model.business_id == bid).delete(synchronize_session=False)
     if user_ids:
         db.query(models.Notification).filter(models.Notification.user_id.in_(user_ids)).delete(synchronize_session=False)
@@ -103,11 +105,12 @@ def _rebuild(db, biz, hash_passcode, now: datetime) -> models.Business:
     db.add(manager)
 
     workers = []
-    for i, (name, rate, br, pos, usual) in enumerate(WORKERS):
+    for i, (name, rate, br, pos, usual, age) in enumerate(WORKERS):
         u = models.User(
             business_id=biz.id, full_name=name, role="worker", passcode=None,
             passcode_hash=random_hash(), hourly_rate=rate, phone=f"05{rng.randint(0, 8)}-{rng.randint(1000000, 9999999)}",
             is_active=True, approval_status="approved", branch_id=branches[br].id,
+            birth_date=date(now.year - age, 1 + (i * 5) % 12, 1 + (i * 7) % 27),
         )
         u._pos, u._usual = pos, usual
         workers.append(u)
@@ -149,21 +152,32 @@ def _rebuild(db, biz, hash_passcode, now: datetime) -> models.Business:
     # ---- today: a few people on shift right now ----
     for w, hours_ago in ((workers[0], 3.2), (workers[4], 2.6), (workers[7], 1.1)):
         shifts.append(models.Shift(user_id=w.id, clock_in=now - timedelta(hours=hours_ago)))
+    # someone forgot to clock out yesterday — the briefing and the payroll audit should catch it
+    shifts.append(models.Shift(user_id=workers[6].id, clock_in=at(today - timedelta(days=1), 17, 56)))
     db.add_all(shifts)
 
     # ---- weekly roster: this week fully, next week partially (so preferences make sense) ----
     this_week = _week_start(today)
     next_week = this_week + timedelta(days=7)
+    # every worker gets two consecutive days off (a realistic, law-abiding pattern)
     roster = []
+    off_start = {w.id: (i * 3) % 7 for i, w in enumerate(workers)}
     for week, days in ((this_week, range(7)), (next_week, range(3))):
         for day in days:
-            for w in rng.sample(workers, 6):
-                kind = w._usual if rng.random() < 0.85 else "double"
+            for w in workers:
+                if day in (off_start[w.id], (off_start[w.id] + 1) % 7) or rng.random() < 0.2:
+                    continue
+                kind = w._usual if rng.random() < 0.9 else "double"
                 roster.append(models.ShiftRoster(
                     business_id=biz.id, user_id=w.id, week_start=week, day_of_week=day,
                     shift_type=kind, position=w._pos,
                     note="סגירת קופה" if (w._pos == "קופה" and kind != "morning") else None,
                 ))
+    # a morning shift today for someone who hasn't clocked in — the briefing flags it and offers a replacement
+    today_idx = (today.weekday() + 1) % 7
+    roster = [r for r in roster if not (r.user_id == workers[2].id and r.week_start == this_week and r.day_of_week == today_idx)]
+    roster.append(models.ShiftRoster(business_id=biz.id, user_id=workers[2].id, week_start=this_week,
+                                     day_of_week=today_idx, shift_type="morning", position=workers[2]._pos))
     db.add_all(roster)
 
     prefs = []
@@ -224,6 +238,20 @@ def _rebuild(db, biz, hash_passcode, now: datetime) -> models.Business:
                                          message=f"⚠️ {who.full_name} עבד {overtime.total_hours} שעות - חריגת שעות!",
                                          is_read=False))
     db.add_all(notes)
+    db.flush()
+
+    # ---- change log: a few realistic entries so the log isn't empty ----
+    db.add(manager)
+    log = [
+        (5, "shift.edit", f"עריכת שעות משמרת: {workers[1].full_name}", "shift", {"clock_out": "23:40"}, {"clock_out": "23:05"}),
+        (4, "leave.approved", f"בקשת חופש של {shira.full_name} אושרה", "leave", {"status": "pending"}, {"status": "approved"}),
+        (3, "roster.save", "שמירת סידור לשבוע הבא: 14 שינויים", "roster", None, None),
+        (1, "employee.update", f"עדכון פרטי {workers[5].full_name}: תעריף", "user", {"hourly_rate": 34}, {"hourly_rate": 36}),
+    ]
+    for days_ago, action, summary, entity, before, after in log:
+        agents.log_audit(db, biz.id, manager, action, summary, entity, None, before=before, after=after,
+                         now=now - timedelta(days=days_ago, hours=rng.randint(1, 6)))
+        db.flush()
     db.commit()
     db.refresh(biz)
     return biz

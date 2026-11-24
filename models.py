@@ -49,6 +49,7 @@ class User(Base):
     approval_status = Column(String, default="approved", nullable=True)  # 'pending' | 'approved' | 'rejected'
     totp_secret = Column(String, nullable=True)
     is_2fa_enabled = Column(Integer, default=0, nullable=True)
+    birth_date = Column(Date, nullable=True)  # לבדיקות חוק עבודת הנוער
 
     business = relationship("Business", back_populates="users")
     branch = relationship("Branch", back_populates="users", foreign_keys=[branch_id])
@@ -149,3 +150,23 @@ class Notification(Base):
 
     business = relationship("Business", back_populates="notifications")
     user = relationship("User", back_populates="notifications")
+
+
+class AuditLog(Base):
+    """יומן שינויים — כל רשומה נושאת hash של הקודמת, כך ששינוי מחוץ למערכת מתגלה."""
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, ForeignKey("businesses.id"), index=True)
+    actor_id = Column(Integer, nullable=True)
+    actor_name = Column(String, nullable=True)
+    action = Column(String)              # e.g. shift.edit, roster.save, leave.approved
+    entity = Column(String, nullable=True)
+    entity_id = Column(String, nullable=True)
+    summary = Column(Text)
+    before = Column(Text, nullable=True)   # JSON
+    after = Column(Text, nullable=True)    # JSON
+    source = Column(String, default="manual")  # manual | ai | system
+    created_at = Column(DateTime)          # naive Israel time, seconds precision (part of the hash)
+    prev_hash = Column(String, default="")
+    hash = Column(String)

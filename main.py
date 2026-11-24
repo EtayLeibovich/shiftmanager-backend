@@ -11,6 +11,7 @@ import models
 import schemas
 import auth
 import ai_agent
+import agents
 import demo
 from database import engine, get_db
 from groq import Groq
@@ -160,8 +161,11 @@ def normalize_week_start(d: date) -> date:
 
 def parse_week_start(value: str) -> date:
     try:
-        return normalize_week_start(date.fromisoformat(str(value)[:10]))
-    except ValueError:
+        d = date.fromisoformat(str(value)[:10])
+        if not (2000 <= d.year <= 2100):
+            raise ValueError
+        return normalize_week_start(d)
+    except (ValueError, OverflowError):
         raise HTTPException(status_code=400, detail="תאריך שבוע לא תקין")
 
 
@@ -266,6 +270,7 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT DEFAULT 'approved'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_2fa_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE",
         ]
     else:
         migrations = [
@@ -278,6 +283,7 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN approval_status TEXT DEFAULT 'approved'",
             "ALTER TABLE users ADD COLUMN totp_secret TEXT",
             "ALTER TABLE users ADD COLUMN is_2fa_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN birth_date DATE",
         ]
     # explicit table creation for new tables (fallback if create_all misses them)
     table_migrations = [
@@ -303,6 +309,7 @@ def run_migrations():
         )""",
     ] if is_postgres else []
 
+    table_migrations.append("CREATE UNIQUE INDEX IF NOT EXISTS ux_audit_prev ON audit_log(business_id, prev_hash)")
     for m in migrations + table_migrations:
         with engine.connect() as conn:
             try:
@@ -399,7 +406,7 @@ class ManualShiftClose(BaseModel):
     clock_out: datetime
 
 
-def get_manager_payload(authorization: Optional[str] = Header(None)) -> dict:
+def get_manager_payload(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token missing")
     token = authorization.split(" ")[1]
@@ -408,6 +415,10 @@ def get_manager_payload(authorization: Optional[str] = Header(None)) -> dict:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     if payload.get("role") != "manager":
         raise HTTPException(status_code=403, detail="Manager access required")
+    # SECURITY: a deactivated/demoted manager's still-valid token must stop working
+    u = db.get(models.User, payload.get("user_id"))
+    if not u or u.is_active is False or u.role != "manager" or u.business_id != payload.get("business_id"):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     return payload
 
 
@@ -841,6 +852,7 @@ def get_employees(business_id: int, manager: models.User = Depends(require_manag
         "email": w.email or "",
         "branch_id": w.branch_id,
         "is_active": w.is_active if w.is_active is not None else True,
+        "birth_date": w.birth_date.isoformat() if w.birth_date else None,
     } for w in workers]
 
 
@@ -863,9 +875,14 @@ def create_employee(user: schemas.UserCreate, manager: models.User = Depends(req
         phone=user.phone,
         email=user.email,
         branch_id=user.branch_id,
+        birth_date=user.birth_date,
         is_active=True,
     )
     db.add(db_user)
+    db.flush()
+    agents.log_audit(db, manager.business_id, manager, "employee.create", f"הוספת עובד/ת: {full_name}",
+                     "user", db_user.id, after={"full_name": full_name, "role": user.role, "hourly_rate": user.hourly_rate},
+                     now=now_israel())
     db.commit()
     db.refresh(db_user)
     return db_user
@@ -903,8 +920,18 @@ def update_employee(employee_id: int, update: schemas.UserUpdate, manager: model
         ensure_unique_credentials(db, data.get("full_name", user.full_name), new_passcode, exclude_id=user.id)
         user.passcode_hash = hash_passcode(new_passcode)
         user.passcode = None
+    before = {f: getattr(user, f) for f in data if getattr(user, f) != data[f]}
+    after = {f: data[f] for f in before}
     for field, value in data.items():
         setattr(user, field, value)
+    if before or new_passcode:
+        labels = {"full_name": "שם", "role": "תפקיד", "hourly_rate": "תעריף", "phone": "טלפון", "email": "אימייל",
+                  "branch_id": "סניף", "is_active": "סטטוס", "birth_date": "תאריך לידה"}
+        changed = [labels.get(f, f) for f in after] + (["סיסמה"] if new_passcode else [])
+        # SECURITY: never log the password itself — only that it changed
+        agents.log_audit(db, manager.business_id, manager, "employee.update",
+                         f"עדכון פרטי {user.full_name}: {', '.join(changed)}", "user", user.id,
+                         before=before, after=after, now=now_israel())
     db.commit()
     db.refresh(user)
     return user
@@ -916,6 +943,8 @@ def deactivate_employee(employee_id: int, manager: models.User = Depends(require
     if user.id == manager.id:
         raise HTTPException(status_code=400, detail="לא ניתן להשבית את עצמך")
     user.is_active = False
+    agents.log_audit(db, manager.business_id, manager, "employee.deactivate", f"השבתת {user.full_name}",
+                     "user", user.id, now=now_israel())
     db.commit()
     return {"status": "deactivated"}
 
@@ -1165,6 +1194,15 @@ def _get_shift_for_manager(shift_id: int, manager: models.User, db: Session) -> 
     return row.Shift
 
 
+def _audit_shift(db: Session, manager: models.User, shift: models.Shift, action: str, what: str,
+                 before=None, after=None, source: str = "manual"):
+    emp = db.get(models.User, shift.user_id)
+    when = to_naive(shift.clock_in)
+    agents.log_audit(db, manager.business_id, manager, action,
+                     f"{what}: {emp.full_name if emp else '?'}" + (f" ({when:%d/%m})" if when else ""),
+                     "shift", shift.id, before=before, after=after, source=source, now=now_israel())
+
+
 @app.post("/shifts/manual-open")
 def manual_open_shift(req: ManualShiftOpen, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     _get_employee_for_manager(req.user_id, manager, db)
@@ -1177,6 +1215,9 @@ def manual_open_shift(req: ManualShiftOpen, manager: models.User = Depends(requi
     # מנהל יכול לפתוח משמרת בכל זמן — עבר או עתיד
     new_shift = models.Shift(user_id=req.user_id, clock_in=req.clock_in)
     db.add(new_shift)
+    db.flush()
+    _audit_shift(db, manager, new_shift, "shift.manual_open", "פתיחה ידנית של משמרת",
+                 after={"clock_in": req.clock_in})
     db.commit()
     db.refresh(new_shift)
     return new_shift
@@ -1190,6 +1231,8 @@ def manual_close_shift(shift_id: int, req: ManualShiftClose, manager: models.Use
         raise HTTPException(status_code=400, detail="יציאה לפני כניסה — בדוק תאריכים")
     shift.clock_out = req.clock_out
     shift.total_hours = round((shift.clock_out - to_naive(shift.clock_in)).total_seconds() / 3600.0, 2)
+    _audit_shift(db, manager, shift, "shift.manual_close", "סגירה ידנית של משמרת",
+                 after={"clock_out": req.clock_out, "total_hours": shift.total_hours})
     db.commit()
     db.refresh(shift)
     return shift
@@ -1225,6 +1268,8 @@ def force_clock_out(shift_id: int, manager: models.User = Depends(require_manage
         shift.total_hours = round(
             (shift.clock_out - to_naive(shift.clock_in)).total_seconds() / 3600.0, 2
         )
+        _audit_shift(db, manager, shift, "shift.force_out", "רישום יציאה על ידי המנהל",
+                     after={"clock_out": shift.clock_out, "total_hours": shift.total_hours})
         db.commit()
     return {"status": "ok"}
 
@@ -1234,9 +1279,12 @@ def edit_shift(shift_id: int, request: ShiftEditRequest, manager: models.User = 
     shift = _get_shift_for_manager(shift_id, manager, db)
     if request.clock_out < request.clock_in:
         raise HTTPException(status_code=400, detail="זמן יציאה לא יכול להיות לפני זמן כניסה")
+    before = {"clock_in": to_naive(shift.clock_in), "clock_out": to_naive(shift.clock_out), "total_hours": shift.total_hours}
     shift.clock_in = request.clock_in
     shift.clock_out = request.clock_out
     shift.total_hours = round((shift.clock_out - shift.clock_in).total_seconds() / 3600.0, 2)
+    _audit_shift(db, manager, shift, "shift.edit", "עריכת שעות משמרת", before=before,
+                 after={"clock_in": request.clock_in, "clock_out": request.clock_out, "total_hours": shift.total_hours})
     db.commit()
     db.refresh(shift)
     return shift
@@ -1245,6 +1293,9 @@ def edit_shift(shift_id: int, request: ShiftEditRequest, manager: models.User = 
 @app.delete("/shifts/{shift_id}")
 def delete_shift(shift_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
     shift = _get_shift_for_manager(shift_id, manager, db)
+    _audit_shift(db, manager, shift, "shift.delete", "מחיקת משמרת",
+                 before={"clock_in": to_naive(shift.clock_in), "clock_out": to_naive(shift.clock_out),
+                         "total_hours": shift.total_hours})
     db.delete(shift)
     db.commit()
     return {"ok": True}
@@ -1465,8 +1516,15 @@ def update_leave_status(leave_id: int, update: schemas.LeaveStatusUpdate, manage
     check_business(manager, leave.business_id)
     if update.status not in ("approved", "rejected", "pending"):
         raise HTTPException(status_code=400, detail="סטטוס לא תקין")
+    prev_status = leave.status
     leave.status = update.status
     leave.manager_note = update.manager_note or ""
+    emp = db.get(models.User, leave.user_id)
+    verb = {"approved": "אושרה", "rejected": "נדחתה", "pending": "הוחזרה להמתנה"}[update.status]
+    agents.log_audit(db, manager.business_id, manager, f"leave.{update.status}",
+                     f"בקשת חופש של {emp.full_name if emp else '?'} ({leave.start_date} עד {leave.end_date}) {verb}",
+                     "leave", leave.id, before={"status": prev_status}, after={"status": update.status},
+                     now=now_israel())
     db.commit()
     # Notify the employee
     user = db.query(models.User).filter(models.User.id == leave.user_id).first()
@@ -1667,6 +1725,10 @@ def ai_execute_action(req: AIActionRequest, manager: dict = Depends(get_manager_
         desc = ai_agent.execute_action(db, manager["business_id"], req.tool, req.args, create_notification)
     except ai_agent.ToolError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    actor = db.get(models.User, manager.get("user_id"))
+    agents.log_audit(db, manager["business_id"], actor, f"ai.{req.tool}", f"פעולת AI שאושרה: {desc}",
+                     "ai_action", None, after={"tool": req.tool, "args": req.args}, source="ai", now=now_israel())
+    db.commit()
     return {"ok": True, "description": desc}
 
 
@@ -1860,10 +1922,25 @@ def save_roster(business_id: int, payload: dict, manager: models.User = Depends(
     own_ids = {u.id for u in db.query(models.User.id).filter(models.User.business_id == business_id).all()}
     if any(e.get("user_id") not in own_ids for e in entries):
         raise HTTPException(status_code=403, detail="ניסיון לשבץ עובד שאינו שייך לעסק")
+    old_rows = db.query(models.ShiftRoster).filter(
+        models.ShiftRoster.business_id == business_id,
+        models.ShiftRoster.week_start == week
+    ).all()
+    old = {(r.user_id, r.day_of_week): r.shift_type for r in old_rows}
+    new = {(e["user_id"], e["day"]): e["shift_type"] for e in entries
+           if e.get("shift_type") and e["shift_type"] != "off"}
+    changes = sorted((k for k in set(old) | set(new) if old.get(k) != new.get(k)), key=str)
     db.query(models.ShiftRoster).filter(
         models.ShiftRoster.business_id == business_id,
         models.ShiftRoster.week_start == week
     ).delete()
+    if changes:
+        names = {u.id: u.full_name for u in db.query(models.User).filter(models.User.business_id == business_id).all()}
+        detail = [{"name": names.get(uid, uid), "day": DAY_NAMES[d] if isinstance(d, int) and 0 <= d < 7 else d,
+                   "from": old.get((uid, d), "off"), "to": new.get((uid, d), "off")} for uid, d in changes]
+        agents.log_audit(db, business_id, manager, "roster.save",
+                         f"שמירת סידור לשבוע {week:%d/%m}: {len(changes)} שינויים", "roster", week.isoformat(),
+                         after={"changes": detail[:60]}, now=now_israel())
     for e in entries:
         if e.get("shift_type") and e["shift_type"] != "off":
             db.add(models.ShiftRoster(
@@ -1873,6 +1950,112 @@ def save_roster(business_id: int, payload: dict, manager: models.User = Depends(
                 note=e.get("note", "") or None
             ))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "compliance": agents.check_week(db, business_id, week)}
 
 
+# ==========================================
+# AGENTS — שומר החוק, תדריך בוקר, מוצא מחליף, מבקר שכר, יומן שינויים
+# ==========================================
+def _parse_day(value: str) -> date:
+    try:
+        d = date.fromisoformat(str(value)[:10])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="תאריך לא תקין")
+    if not (2000 <= d.year <= 2100):
+        raise HTTPException(status_code=400, detail="תאריך לא תקין")
+    return d
+
+
+@app.get("/agents/roster-check/{business_id}")
+def agent_roster_check(business_id: int, week_start: str, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    return agents.check_week(db, business_id, parse_week_start(week_start))
+
+
+@app.post("/agents/roster-check/{business_id}")
+def agent_roster_check_draft(business_id: int, payload: dict, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    """בודק סידור שעוד לא נשמר (מה שהמנהל רואה כרגע במסך)."""
+    check_business(manager, business_id)
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries חייב להיות רשימה")
+    return agents.check_week(db, business_id, parse_week_start(payload.get("week_start")), week_entries=entries)
+
+
+@app.get("/agents/briefing/{business_id}")
+def agent_briefing(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    return agents.daily_briefing(db, business_id, now_israel())
+
+
+@app.get("/agents/replacements/{business_id}")
+def agent_replacements(business_id: int, date_str: str = Query(..., alias="date"), shift_type: str = "morning",
+                       exclude: Optional[int] = None, manager: models.User = Depends(require_manager),
+                       db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    if shift_type not in agents.SHIFT_WINDOWS:
+        raise HTTPException(status_code=400, detail="סוג משמרת לא תקין")
+    return agents.suggest_replacements(db, business_id, _parse_day(date_str), shift_type, exclude)
+
+
+@app.get("/agents/payroll-audit/{business_id}")
+def agent_payroll_audit(business_id: int, year: Optional[int] = None, month: Optional[int] = None,
+                        manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    now = now_israel()
+    year, month = year or now.year, month or now.month
+    if not (1 <= month <= 12 and 2000 <= year <= 2100):
+        raise HTTPException(status_code=400, detail="חודש לא תקין")
+    return agents.payroll_audit(db, business_id, year, month, now)
+
+
+@app.get("/audit/{business_id}")
+def get_audit_log(business_id: int, limit: int = 100, entity: Optional[str] = None,
+                  manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    return agents.list_audit(db, business_id, limit, entity)
+
+
+@app.get("/audit/{business_id}/verify")
+def verify_audit_log(business_id: int, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    check_business(manager, business_id)
+    return agents.verify_chain(db, business_id)
+
+
+class AssignShiftRequest(BaseModel):
+    employee_id: int
+    date: str
+    shift_type: str
+    notify: bool = True
+    replaces_employee_id: Optional[int] = None
+
+
+@app.post("/agents/assign/{business_id}")
+def agent_assign_shift(business_id: int, req: AssignShiftRequest, manager: models.User = Depends(require_manager), db: Session = Depends(get_db)):
+    """שיבוץ מהיר של מחליף (מתוך מוצא המחליף / תדריך הבוקר)."""
+    check_business(manager, business_id)
+    if req.shift_type not in agents.SHIFT_WINDOWS:
+        raise HTTPException(status_code=400, detail="סוג משמרת לא תקין")
+    d = _parse_day(req.date)
+    emp = _get_employee_for_manager(req.employee_id, manager, db)
+    if not agents._is_schedulable(emp):
+        raise HTTPException(status_code=400, detail="אפשר לשבץ רק עובד פעיל ומאושר")
+    new_issues = agents.check_hypothetical(db, business_id, emp.id, d, req.shift_type)
+    replaced = None
+    if req.replaces_employee_id and req.replaces_employee_id != emp.id:
+        replaced = _get_employee_for_manager(req.replaces_employee_id, manager, db)  # tenant check
+        ai_agent._exec_set_roster_shift(db, business_id, {"employee_id": replaced.id, "date": d.isoformat(), "shift_type": "off"})
+    args = {"employee_id": emp.id, "date": d.isoformat(), "shift_type": req.shift_type}
+    if replaced:
+        args["replaces_employee_id"] = replaced.id
+    ai_agent._exec_set_roster_shift(db, business_id, args)
+    label = agents.SHIFT_NAMES[req.shift_type]
+    agents.log_audit(db, business_id, manager, "roster.assign",
+                     f"שיבוץ {emp.full_name} ל{label} ב-{d:%d/%m}" + (f" במקום {replaced.full_name}" if replaced else ""),
+                     "roster", d.isoformat(),
+                     after=args, now=now_israel())
+    db.commit()
+    if req.notify:
+        create_notification(db, business_id, "manager_message",
+                            f"שובצת למשמרת {label} ביום {agents.DAY_NAMES[agents.day_index(d)]} {d:%d/%m}", user_id=emp.id)
+    return {"ok": True, "warnings": [i["message"] for i in new_issues if i["severity"] != "info"]}
